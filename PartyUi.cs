@@ -159,7 +159,7 @@ internal sealed partial class ScoutWindows
     private void YourParty()
     {
         if (p.CurrentParty is not { } detail)
-        { ImGui.TextWrapped(!p.Active ? "Start Watch to read your current party." : p.View.Party.InParty ? "Waiting for your party roster…" : "You are not in a party."); return; }
+        { ImGui.TextWrapped(p.View.Party.InParty ? "Waiting for your party roster…" : "You are not in a party."); return; }
         ImGui.TextColored(Accent, $"YOUR PARTY · {(p.CurrentScore is { } score ? $"{score} pts" : "SCORE UNAVAILABLE")}");
         ImGui.SetNextItemWidth(-1);
         if (ImGui.BeginCombo("##CurrentDuty", detail.Duty == 0 ? "Select your party’s duty…" : p.DutyLabel(detail.Duty)))
@@ -181,6 +181,7 @@ internal sealed partial class ScoutWindows
             ImGui.EndCombo();
         }
         if (detail.Recruitment is { } listing) RecruitmentLine(listing);
+        if (detail.Description.Length > 0) ImGui.TextWrapped(detail.Description);
         SummaryLine(detail, detail.Members.Length);
         DataNotice(); Roster(detail);
     }
@@ -188,14 +189,11 @@ internal sealed partial class ScoutWindows
     private void SummaryLine(PartyDetail? detail, int occupied)
     {
         var data = detail?.Members.Select(m => p.DataFor(m, detail.Duty)).ToArray() ?? [];
-        var parts = RosterSummary.Averages(data, occupied);
-        var text = string.Join(" · ", parts.Select((part, i) =>
-            $"{(parts.Length > 1 ? $"P{i + 1} " : "")}Avg {part.Average?.ToString("0.0") ?? "—"} ({part.Coverage}/{part.Total})"));
         var clears = data.Count(RosterSummary.FullClear);
         var knownProgress = data.Count(d => d?.ProgressError is null && d?.Progress is { } progress && TomestoneData.HasData(progress) ||
             d?.ParseError is null && d?.Parses?.Any(p => !p.Failed && p.Kills.HasValue) == true);
-        OneLine(text + $" · CLR {(knownProgress == 0 ? "—" : clears.ToString())}", Muted);
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Mean of member averages for this duty and each listed job; coverage is members with public data / occupied slots.\nPhases are separate. CLR counts members with full-clear evidence; unknown data is not zero.\nThese statistics never affect role-weight ranking.");
+        OneLine(knownProgress == 0 ? "Clear data unavailable" : $"CLR {clears}/{occupied} · {knownProgress} checked", Muted);
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("CLR counts members with full-clear evidence; unknown data is not zero. Player averages are shown on each member.\nThese statistics never affect role-weight ranking.");
     }
     private void DataNotice()
     {

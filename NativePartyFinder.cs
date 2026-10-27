@@ -9,7 +9,11 @@ using PartyScout.Core;
 namespace PartyScout;
 
 internal sealed record PartySnapshot(bool InParty, ulong Leader, byte[] Jobs, long PartyId, bool Alliance);
-internal sealed record NativeView(bool Open, Vector2 FinderPosition, Vector2 FinderSize, PartySnapshot Party, uint CurrentJob);
+internal sealed record NativeDetailWindow(ulong ListingId, Vector2 Position, Vector2 Size);
+internal sealed record NativeView(bool Open, Vector2 FinderPosition, Vector2 FinderSize, PartySnapshot Party, uint CurrentJob)
+{
+    internal NativeDetailWindow? Detail { get; init; }
+}
 internal sealed record FinderPage(byte Area, byte Category, string Key, bool Previous, bool Next, int ExpectedListings);
 internal sealed record SocialRoster(SocialPerson[] People, bool FreeCompanyVerified, int FreeCompanyTotal, ulong FreeCompanyId);
 
@@ -19,7 +23,8 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
     private ushort hiddenAddon;
     private ushort quietFinderAddon;
     private bool previousFinderDisableFocus;
-    private ushort hiddenDetail;
+    private ushort hiddenDetail, hiddenManualDetail;
+    private ulong hiddenManualListing;
     private ushort backgroundDetailAddon;
     private ushort hiddenJoinDetail, hiddenJoinConfirmation, quietJoinDetail, quietJoinConfirmation;
     private bool previousJoinDetailFocus, previousJoinConfirmationFocus;
@@ -28,6 +33,7 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
     private string previousFocusName = "";
     private ushort previousFocusId;
     public bool Hidden => hiddenAddon != 0;
+    internal bool ManualDetailHidden => hiddenManualDetail != 0;
     private AtkUnitBase* Addon(string name) => (AtkUnitBase*)gui.GetAddonByName(name).Address;
     private static AtkUnitBase* AddonById(uint id, string name)
     {
@@ -82,7 +88,14 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
             }
             alliance |= cross->IsInAllianceRaid;
         }
-        return new NativeView(open, position, size, new PartySnapshot(inCross || party.Length > 0, leader, jobs, party.PartyId, alliance), player.ClassJob.RowId);
+        var detail = Addon("LookingForGroupDetail");
+        var finder = AgentLookingForGroup.Instance();
+        var visibleDetail = detail != null && detail->IsReady && detail->IsVisible && detail->RootNode != null &&
+            detail->RootNode->IsVisible() && finder != null && finder->LastViewedListing.ListingId != 0
+                ? new NativeDetailWindow(finder->LastViewedListing.ListingId, new Vector2(detail->X, detail->Y),
+                    new Vector2(detail->GetScaledWidth(true), detail->GetScaledHeight(true))) : null;
+        return new NativeView(open, position, size, new PartySnapshot(inCross || party.Length > 0, leader, jobs, party.PartyId, alliance), player.ClassJob.RowId)
+            { Detail = visibleDetail };
     }
 
     public bool DutyPrompt => Visible("ContentsFinderConfirm");
@@ -101,10 +114,19 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
     }
     private bool Visible(string name) { var a = Addon(name); return a != null && a->IsVisible; }
 
-    public void Open()
+    internal bool FinderActive
+    {
+        get { var agent = AgentLookingForGroup.Instance(); return agent != null && agent->IsAgentActive(); }
+    }
+    internal bool FinderReady => FinderActive && Page() is not null;
+
+    public bool Open()
     {
         var agent = AgentLookingForGroup.Instance();
-        if (agent != null && !agent->IsAgentActive()) agent->Show();
+        if (agent == null || agent->IsAgentActive()) return false;
+        var openedByPlugin = !Visible("LookingForGroup");
+        agent->Show();
+        return openedByPlugin;
     }
     public bool Refresh()
     {
@@ -131,6 +153,24 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
             hiddenAddon = 0;
         }
     }
+    internal void SetManualDetailHidden(bool hide)
+    {
+        var addon = Addon("LookingForGroupDetail");
+        var listing = VisibleDetailId;
+        if (!hide)
+        {
+            if (hiddenManualDetail != 0 && addon != null && addon->Id == hiddenManualDetail &&
+                listing == hiddenManualListing && addon->RootNode != null) addon->RootNode->ToggleVisibility(true);
+            hiddenManualDetail = 0; hiddenManualListing = 0;
+            return;
+        }
+        if (addon == null || !addon->IsReady || listing == 0 || addon->RootNode == null) return;
+        if (hiddenManualDetail != 0 && (addon->Id != hiddenManualDetail || listing != hiddenManualListing))
+        { hiddenManualDetail = 0; hiddenManualListing = 0; }
+        if (!addon->RootNode->IsVisible()) return;
+        hiddenManualDetail = addon->Id; hiddenManualListing = listing;
+        addon->RootNode->ToggleVisibility(false); RestoreFocus(addon);
+    }
     public void Close()
     {
         SetHidden(false);
@@ -138,6 +178,14 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
         {
             var a = Addon(name); if (a != null && a->IsVisible) a->Close(true);
         }
+    }
+    internal void CloseFinder()
+    {
+        SetHidden(false);
+        var addon = Addon("LookingForGroup");
+        if (addon != null && addon->IsVisible) addon->Close(true);
+        var agent = AgentLookingForGroup.Instance();
+        if (agent != null && agent->IsAgentActive()) agent->Hide();
     }
     public bool OpenListing(ulong id, bool reveal = true)
     {

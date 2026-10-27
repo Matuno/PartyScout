@@ -29,18 +29,22 @@ internal sealed unsafe class PartyPreview : IDisposable
     private readonly Hook<AgentLookingForGroup.Delegates.PopulateListingData>? listingHook;
     private readonly Hook<UIGlobals.Delegates.PlaySoundEffect>? soundHook;
     private readonly Hook<SoundManager.Delegates.PlaySystemSound>? systemSoundHook;
-    private long requested, background, plateErrorId;
+    private long requested, background, plateErrorId, manualId;
     private DateTimeOffset requestUntil, nextRequest, listingUntil, listingStarted, nextRead, nextListing;
     private DateTimeOffset listingErrorUntil, plateErrorUntil;
-    private bool listingFailure, plateFailure;
+    private bool listingFailure, plateFailure, manualPlate;
     [ThreadStatic] private static int quietSounds, mutedSystemCalls;
     private volatile bool enabled, keepLateReplies;
     internal Dictionary<ulong, PartyDetail> Parties { get; } = [];
     internal string? Error { get; }
-    internal ulong ManualId { get; private set; }
+    internal ulong ManualId { get => (ulong)Interlocked.Read(ref manualId); private set => Interlocked.Exchange(ref manualId, unchecked((long)value)); }
     internal bool DetailOpen => native.VisibleDetailId != 0 && native.VisibleDetailId != BackgroundId;
     internal ulong BackgroundId => (ulong)Interlocked.Read(ref background);
     internal bool Busy => BackgroundId != 0;
+    internal bool PlatePending => Interlocked.Read(ref requested) != 0;
+    internal bool ManualPlatePending => PlatePending && manualPlate;
+    internal int CachedNames => names.Count;
+    internal bool SuppressDetail => Busy || Volatile.Read(ref backgroundCallbacks) != 0;
     internal bool QuietAudioAvailable => soundHook is not null && systemSoundHook is not null;
     internal int SuppressedListingErrors { get; private set; }
     internal int SuppressedPlateErrors { get; private set; }
@@ -84,9 +88,9 @@ internal sealed unsafe class PartyPreview : IDisposable
             { id = copy.Id; if (enabled && received.Count < 256) received.Enqueue(copy); }
         }
         catch { }
-        var late = SweepPolicy.IsLateBackground(id, owned, WasBackgroundListing(id, DateTimeOffset.UtcNow), switchTarget(id));
+        var late = SweepPolicy.IsLateBackground(id, owned, WasBackgroundListing(id, DateTimeOffset.UtcNow), switchTarget(id), id != 0 && id == ManualId);
         if (late) owned = id;
-        var manual = owned != 0 && nativeFinderHovered();
+        var manual = owned != 0 && (id != 0 && id == ManualId || nativeFinderHovered());
         if (!manual && framework.IsInFrameworkUpdateThread && owned != 0)
         {
             native.RememberFocus();
@@ -94,9 +98,9 @@ internal sealed unsafe class PartyPreview : IDisposable
             if (id != 0 && id == owned) native.HideBackgroundDetail(id);
         }
         var quiet = !manual && owned != 0;
-        if (quiet) quietSounds++;
+        if (quiet) { quietSounds++; Interlocked.Increment(ref backgroundCallbacks); }
         try { listingHook!.Original(agent, data); }
-        finally { if (quiet) quietSounds--; }
+        finally { if (quiet) { quietSounds--; Interlocked.Decrement(ref backgroundCallbacks); } }
         if (framework.IsInFrameworkUpdateThread && owned != 0 && manual)
         {
             native.ReleaseBackgroundDetail(id != 0 ? id : native.VisibleDetailId, false);
@@ -128,7 +132,7 @@ internal sealed unsafe class PartyPreview : IDisposable
         if (quietSounds > 0) { mutedSystemCalls++; Interlocked.Increment(ref mutedSystemSounds); volume = 0; }
         return systemSoundHook!.Original(manager, path, volume, soundNumber, fadeInDuration, autoRelease, volumeCategory);
     }
-    private int suppressedSounds, passedThroughSounds, mutedSystemSounds;
+    private int suppressedSounds, passedThroughSounds, mutedSystemSounds, backgroundCallbacks;
     internal bool Quiet(Func<bool> action)
     {
         quietSounds++;
@@ -140,7 +144,7 @@ internal sealed unsafe class PartyPreview : IDisposable
     internal bool QuietLog(uint id, DateTimeOffset now, bool manual, bool listingVerified, bool plateVerified)
     {
         var listingPending = listingVerified && listingErrorUntil != default && now <= listingErrorUntil;
-        var platePending = plateVerified && Interlocked.Read(ref plateErrorId) != 0 && now <= plateErrorUntil;
+        var platePending = SweepPolicy.OwnedPlatePending(Interlocked.Read(ref requested), Interlocked.Read(ref plateErrorId), plateVerified, now, plateErrorUntil);
         if (!SweepPolicy.IsOwnedError(id, listingPending, platePending, manual)) return false;
         if (id == 974) { listingFailure = true; SuppressedListingErrors++; }
         else { plateFailure = true; SuppressedPlateErrors++; }
@@ -212,9 +216,10 @@ internal sealed unsafe class PartyPreview : IDisposable
         nextRead = now.AddMilliseconds(200);
         var visible = native.VisibleDetailId;
         var owned = BackgroundId;
+        if (visible == 0) ManualId = 0;
         if (visible != 0 && visible != BackgroundId)
         {
-            if ((owned != 0 || WasBackgroundListing(visible, now)) && !nativeFinderHovered())
+            if (visible != ManualId && (owned != 0 || WasBackgroundListing(visible, now)) && !nativeFinderHovered())
             { native.SuppressBackgroundDetail(); native.HideBackgroundDetail(visible); CloseUnexpectedQuiet(visible); }
             else
             {
@@ -262,24 +267,27 @@ internal sealed unsafe class PartyPreview : IDisposable
         {
             if (reply.Id != (ulong)Interlocked.Read(ref requested)) continue;
             Interlocked.Exchange(ref requested, 0);
+            Interlocked.Exchange(ref plateErrorId, 0);
             CacheName(reply.Id, reply.Name, reply.World, now.AddMinutes(5)); changed = true;
         }
         if (Interlocked.Read(ref requested) != 0 && now >= requestUntil)
         {
             var id = (ulong)Interlocked.Exchange(ref requested, 0);
+            Interlocked.Exchange(ref plateErrorId, 0);
             CacheName(id, "", 0, now.AddMinutes(10)); changed = true;
         }
         if (changed) ApplyNames();
         foreach (var id in Parties.Where(kv => now - kv.Value.Collected > TimeSpan.FromMinutes(10) || kv.Value.Recruitment?.Expires <= now).Select(kv => kv.Key).ToArray()) Parties.Remove(id);
     }
-    internal void ResolveNext(IEnumerable<PartyDetail> parties, DateTimeOffset now)
+    internal void ResolveNext(IEnumerable<PartyDetail> parties, DateTimeOffset now, bool manualDetail = false)
     {
         if (packetHook is null || Interlocked.Read(ref requested) != 0 || now < nextRequest ||
-            nativeFinderHovered() || native.AdventurerPlateOpen()) return;
+            SweepPolicy.PlateInteractionBlocks(manualDetail, nativeFinderHovered(), native.AdventurerPlateOpen())) return;
         foreach (var member in parties.SelectMany(p => p.Members).DistinctBy(m => m.Id))
         {
             if (member.Id == 0 || member.Resolved || names.TryGetValue(member.Id, out var known) && known.Until > now) continue;
             var card = CharaCard.Instance(); if (card == null) return;
+            manualPlate = manualDetail;
             Interlocked.Exchange(ref requested, (long)member.Id);
             Interlocked.Exchange(ref plateErrorId, (long)member.Id); plateErrorUntil = now.AddSeconds(7);
             nextRequest = now.AddMilliseconds(900); requestUntil = now.AddSeconds(5);
@@ -313,7 +321,7 @@ internal sealed unsafe class PartyPreview : IDisposable
         if (!keepSound && soundHook?.IsEnabled == true) soundHook.Disable();
         if (!keepSound && systemSoundHook?.IsEnabled == true) systemSoundHook.Disable();
     }
-    internal void Stop() { Pause(); ManualId = 0; Parties.Clear(); names.Clear(); }
+    internal void Stop(bool clearNames = true) { Pause(); ManualId = 0; Parties.Clear(); if (clearNames) names.Clear(); }
     public void Dispose() { Stop(); soundHook?.Dispose(); systemSoundHook?.Dispose(); listingHook?.Dispose(); packetHook?.Dispose(); }
     private bool WasBackgroundListing(ulong id, DateTimeOffset now) =>
         recentListings.TryGetValue(id, out var until) && now <= until;

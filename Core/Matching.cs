@@ -37,7 +37,7 @@ public class Settings
     public int[] RoleWeights = [10, 10, 5, 5, 5];
     public bool Alerts = true, TimedJoin;
     public int JoinDelay = 30;
-    public bool Toast = true, Sound = true, HideNative;
+    public bool Toast = true, Sound = true, HideNative, ShowNativeFinder;
     public int SoundId = 6;
     public float Scale = 1, Rounding = 8, RowSpacing = 4, Opacity = .98f;
     public bool Compact = true, Debug;

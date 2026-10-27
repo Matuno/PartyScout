@@ -51,7 +51,7 @@ public sealed partial class Plugin : IDalamudPlugin
     private DateTimeOffset nextRefresh, collectingUntil, nextEvaluation, statusUntil;
     private uint territory;
     private bool collecting, disposed;
-    private volatile bool active;
+    private volatile bool active, showNativeFinder;
     private int finderShowEvents, finderDrawEvents, finderVisibleDraws, finderOffThreadEvents;
     private int finderBlockedDraws, detailBlockedDraws, detailOffThreadEvents;
     private readonly bool quietListingError, quietPlateErrors;
@@ -60,6 +60,7 @@ public sealed partial class Plugin : IDalamudPlugin
 
     internal Configuration Settings { get; }
     internal bool Active { get => active; private set => active = value; }
+    internal bool ShowNativeFinder => showNativeFinder;
     internal bool Automation { get; private set; }
     internal AlertState Alert { get; } = new();
     internal AlertInbox Inbox { get; } = new();
@@ -88,8 +89,9 @@ public sealed partial class Plugin : IDalamudPlugin
         commands = commandManager; this.log = log; notifications = notificationManager; chat = chatGui; this.addonLifecycle = addonLifecycle;
         Textures = textures;
         Settings = pi.GetPluginConfig() as Configuration ?? new Configuration();
-        var migrate = Settings.Version < 5 || Settings.Profiles is not { Count: > 0 };
-        Settings.Normalize(Settings.Version); Settings.Version = 5;
+        var migrate = Settings.Version < 5 || Settings.Profiles is not { Count: > 0 } || Settings.CurrentPartyDuty != 0;
+        Settings.CurrentPartyDuty = 0;
+        Settings.Normalize(Settings.Version); Settings.Version = 5; showNativeFinder = Settings.ShowNativeFinder;
         dutySizes = data.GetExcelSheet<ContentFinderCondition>().Where(d => d.RowId > 0 && d.ContentMemberType.IsValid)
             .ToDictionary(d => d.RowId, d => ListingFilter.DutyCapacity(d.ContentMemberType.Value.MembersPerParty, d.ContentMemberType.Value.PartyCount));
         filter = new ListingFilter(Settings, dutySizes);
@@ -152,12 +154,13 @@ public sealed partial class Plugin : IDalamudPlugin
         windows.MainOpen = true;
         if (Active) return;
         if (!SafeToMonitor()) { ActionStatus("Available when logged in, outside duties and combat."); return; }
+        passivePreview = false;
         Active = true; Automation = false; territory = client.TerritoryType;
         Alert.Reset(); Inbox.Clear(); listings.Clear(); batch.Clear(); Matches = []; OverviewMatches = []; OverviewListings = []; collecting = false;
         while (incoming.TryDequeue(out _)) { }
         nextRefresh = DateTimeOffset.MinValue;
-        preview.Start(); native.SetHidden(true);
-        preview.Quiet(() => { native.Open(); return true; }); Status = "Connecting to Party Finder…";
+        preview.Start(); native.SetHidden(FinderVisibility.HideFinder(Active, showNativeFinder));
+        Status = "Connecting to Party Finder…";
         pf.ReceiveListing += Receive;
         if (Settings.WatchContacts) { preview.Quiet(() => { native.RefreshSocial(); return true; }); nextSocialRead = default; }
         if (WantsSweep) StartSweep();
@@ -168,13 +171,35 @@ public sealed partial class Plugin : IDalamudPlugin
         FinishJoin(true);
         Active = Automation = false; collecting = false;
         pf.ReceiveListing -= Receive; Alert.Reset(); Inbox.Clear(); DismissToast();
-        preview.Quiet(() => { native.FinishFinderShow(); native.SetHidden(false); if (closeNative && wasActive) native.Close(); preview.Stop(); return true; });
+        preview.Quiet(() =>
+        {
+            native.FinishFinderShow(); native.SetHidden(false); native.SetManualDetailHidden(false);
+            if (closeNative && wasActive) native.Close();
+            else if (ownsFinder && !windows.NativeFinderInteracting && !preview.DetailOpen) native.CloseFinder();
+            preview.Stop(); return true;
+        });
+        ownsFinder = openingFinder = profileRefreshPending = passivePreview = false;
         CancelLookups(true); ClearCompanyRoster(); Scanning = socialSweepRequested = BrowseAll = inspectionSweep = false; socialListings.Clear(); ResetSocialHits(); scanPageListings.Clear(); scanAttemptedDetails.Clear(); socialCollectionQueue.Clear(); scannedPages.Clear();
         Status = reason;
         listings.Clear(); batch.Clear(); Matches = []; OverviewMatches = []; OverviewListings = []; CurrentListing = null;
         while (incoming.TryDequeue(out _)) { }
     }
     internal void ToggleMonitoring() { if (Active) Stop("Monitoring paused."); else Open(); }
+    internal void ToggleNativeFinder()
+    {
+        showNativeFinder = !showNativeFinder; Settings.ShowNativeFinder = showNativeFinder;
+        if (Active)
+        {
+            if (showNativeFinder) native.FinishFinderShow();
+            native.SetHidden(FinderVisibility.HideFinder(Active, showNativeFinder));
+            if (showNativeFinder)
+            {
+                native.SetManualDetailHidden(false);
+            }
+            else if (!Joining && preview.DetailOpen) native.SetManualDetailHidden(true);
+        }
+        Save();
+    }
     internal void ToggleAutomation()
     {
         Automation = Active && !Automation;
@@ -230,37 +255,45 @@ public sealed partial class Plugin : IDalamudPlugin
     }
     private void OnLogMessage(ILogMessage message)
     {
-        if (!Active || !framework.IsInFrameworkUpdateThread) return;
+        if ((!Active && !passivePreview) || !framework.IsInFrameworkUpdateThread) return;
         if (message.LogMessageId != 974 && message.LogMessageId is not (>= 5855 and <= 5860)) return;
-        var manual = windows.NativeFinderInteracting || native.AdventurerPlateOpen();
+        var manual = message.LogMessageId == 974
+            ? windows.NativeFinderInteracting || native.AdventurerPlateOpen()
+            : SweepPolicy.PlateInteractionBlocks(NativeParty is not null || preview.ManualPlatePending,
+                windows.NativeFinderInteracting, native.AdventurerPlateOpen());
         if (preview.QuietLog(message.LogMessageId, DateTimeOffset.UtcNow, manual, quietListingError, quietPlateErrors))
             message.PreventOriginal();
     }
     private void OnFinderLifecycle(AddonEvent type, AddonArgs args)
     {
         if (!Active) return;
-        if (type == AddonEvent.PreDraw) { args.PreventOriginal(); Interlocked.Increment(ref finderBlockedDraws); }
+        var hide = FinderVisibility.HideFinder(Active, showNativeFinder);
+        var quietOpen = openingFinder;
+        if (type == AddonEvent.PreShow && !quietOpen && framework.IsInFrameworkUpdateThread) ownsFinder = false;
+        if (!hide && !quietOpen) return;
+        if (type == AddonEvent.PreDraw && hide) { args.PreventOriginal(); Interlocked.Increment(ref finderBlockedDraws); }
         if (type == AddonEvent.PreShow && args is AddonShowArgs quietShow) quietShow.SilenceOpenSoundEffect = true;
         if (!framework.IsInFrameworkUpdateThread) { Interlocked.Increment(ref finderOffThreadEvents); return; }
         if (type == AddonEvent.PreShow && args is AddonShowArgs) { finderShowEvents++; native.PrepareFinderShow(args.Addon.Address); }
         else if (type is AddonEvent.PostShow or AddonEvent.PostSetup or AddonEvent.PreDraw)
         {
-            native.SetHidden(true);
-            if (type == AddonEvent.PostShow) native.FinishFinderShow(args.Addon.Address);
+            if (hide) native.SetHidden(true);
+            if (type == AddonEvent.PostShow) { native.FinishFinderShow(args.Addon.Address); openingFinder = false; }
             if (type == AddonEvent.PreDraw) { finderDrawEvents++; if (native.FinderRootVisible) finderVisibleDraws++; }
         }
     }
     private void OnJoinLifecycle(AddonEvent type, AddonArgs args)
     {
         if (!Active) return;
-        if (args.AddonName == "LookingForGroupDetail")
+        var hidingDetail = args.AddonName == "LookingForGroupDetail" && FinderVisibility.HideDetail(Active, showNativeFinder, preview.SuppressDetail, Joining);
+        if (hidingDetail)
         {
             if (type == AddonEvent.PreDraw) { args.PreventOriginal(); Interlocked.Increment(ref detailBlockedDraws); }
             if (type == AddonEvent.PreShow && args is AddonShowArgs quietShow) quietShow.SilenceOpenSoundEffect = true;
         }
         if (!framework.IsInFrameworkUpdateThread)
         {
-            if (args.AddonName == "LookingForGroupDetail") Interlocked.Increment(ref detailOffThreadEvents);
+            if (hidingDetail) Interlocked.Increment(ref detailOffThreadEvents);
             else if (joining is not null) Interlocked.Increment(ref finderOffThreadEvents);
             return;
         }
@@ -288,13 +321,16 @@ public sealed partial class Plugin : IDalamudPlugin
             {
                 var previousParty = View.Party;
                 View = native.Capture();
+                var now = DateTimeOffset.UtcNow;
+                ObserveCurrentParty(previousParty, now);
                 if (Active && !Joining && (previousParty.InParty != View.Party.InParty || previousParty.Leader != View.Party.Leader || previousParty.PartyId != View.Party.PartyId))
                 { Alert.Reset(); Automation = false; DismissToast(); }
                 if (Active && (!SafeToMonitor() || territory != client.TerritoryType)) Stop("Stopped for duty or client-state change.", true);
                 while (actions.TryDequeue(out var action)) action();
-                if (!Active) return;
-                native.SetHidden(true);
-                var now = DateTimeOffset.UtcNow;
+                if (!Active) { CollectManualWhenIdle(now); return; }
+                native.SetHidden(FinderVisibility.HideFinder(Active, showNativeFinder));
+                if (showNativeFinder) native.SetManualDetailHidden(false);
+                else if (!Joining && preview.DetailOpen) native.SetManualDetailHidden(true);
                 var received = false;
                 while (incoming.TryDequeue(out var listing))
                 {
@@ -327,19 +363,14 @@ public sealed partial class Plugin : IDalamudPlugin
                         if (Settings.Debug) log.Debug("Party Scout refreshed: {Count} listings.", listings.Count);
                     }
                 }
-                if (now >= nextRefresh && !collecting && joining is null && !preview.Busy && !Scanning)
-                {
-                    preview.Quiet(() => { native.Open(); return true; }); nextRefresh = now.AddSeconds(10);
-                    if (preview.Quiet(native.Refresh)) { collecting = true; collectingUntil = now.AddSeconds(3); batch.Clear(); }
-                    else if (Settings.Debug) log.Debug("Party Scout waiting for native PF refresh cooldown.");
-                }
+                if (!CanStartSweep(now)) TickProfileRefresh(now);
                 if (received || now >= nextEvaluation) { RebuildMatches(now); nextEvaluation = now.AddSeconds(1); }
                 if (!Joining) { Collect(now); TickScan(now); }
-                if (WantsSweep && !Scanning && !Joining && !preview.DetailOpen && !windows.NativeFinderInteracting && !native.AdventurerPlateOpen() && now >= nextSweepRestart) StartSweep();
+                if (CanStartSweep(now)) StartSweep();
                 if (windows.EditingSetup) { if (Joining) CancelJoin("Party switch cancelled. Check your party."); Alert.SuppressExisting(Matches); DismissToast(); }
                 else if (Joining) TickJoin(now);
                 else UpdateAlert(now);
-                native.SetHidden(true);
+                native.SetHidden(FinderVisibility.HideFinder(Active, showNativeFinder));
             }
             catch (Exception ex)
             {
@@ -391,7 +422,17 @@ public sealed partial class Plugin : IDalamudPlugin
         pi.UiBuilder.Draw -= Draw; pi.UiBuilder.OpenMainUi -= OpenMain; pi.UiBuilder.OpenConfigUi -= OpenSettings;
         commands.RemoveHandler("/partyscout"); runTests.UnregisterFunc(); listTests.UnregisterFunc(); DismissToast();
         lookupCancellation?.Cancel(); companyCancellation?.Cancel();
-        void ReleaseNative() { FinishJoin(true); preview.Quiet(() => { native.FinishFinderShow(); native.SetHidden(false); preview.Dispose(); return true; }); }
+        void ReleaseNative()
+        {
+            FinishJoin(true);
+            preview.Quiet(() =>
+            {
+                native.FinishFinderShow(); native.SetHidden(false); native.SetManualDetailHidden(false);
+                if (ownsFinder && !windows.NativeFinderInteracting && !preview.DetailOpen) native.CloseFinder();
+                preview.Dispose(); return true;
+            });
+            ownsFinder = openingFinder = profileRefreshPending = false;
+        }
         if (framework.IsInFrameworkUpdateThread) ReleaseNative();
         else framework.Run(ReleaseNative).GetAwaiter().GetResult();
         lookupTask?.GetAwaiter().GetResult(); companyTask?.GetAwaiter().GetResult(); lookupCancellation?.Dispose(); companyCancellation?.Dispose(); lookups.Clear(); lookups.Dispose();
@@ -414,10 +455,13 @@ public sealed partial class Plugin : IDalamudPlugin
                 return JsonSerializer.Serialize(new { ok = !disposed && (!Automation || Active) && (!Joining || Active) && (!Scanning || Active) && (!preview.Busy || Active && !Joining),
                 test = "smoke", assemblySha256 = assemblyHash, frameworkThread = framework.IsInFrameworkUpdateThread,
                 active = Active, automation = Automation, joining = Joining, nativeOpen = native.Capture().Open,
-                hiddenByPlugin = native.Hidden, matches = Matches.Length, displayedMatches = OverviewMatches.Length, cachedListings = listings.Count,
+                hiddenByPlugin = native.Hidden, showNativeFinder, manualDetailHiddenByPlugin = native.ManualDetailHidden, ownsFinder, profileRefreshPending, matches = Matches.Length, displayedMatches = OverviewMatches.Length, cachedListings = listings.Count,
                 browseAll = BrowseAll, scopedListings = OverviewListings.Length, inspectionSweep,
                 profiles = Settings.Profiles.Count, enabledProfiles = Settings.Profiles.Count(p => p.Enabled),
                 highEndDuties = DutyChoices.Count(d => d.HighEnd), editingSetup = windows.EditingSetup,
+                currentPartyDutyKnown = partyContext.Duty != 0, currentPartyDescriptionCaptured = partyContext.Recruitment is { Description.Length: > 0 },
+                nativeDetailOverlay = NativeParty is not null, passivePreview,
+                plateRequestPending = preview.PlatePending, manualPlateRequestPending = preview.ManualPlatePending, cachedMemberNames = preview.CachedNames,
                 ribbonMode = windows.Mode.ToString(), mainOpen = windows.MainOpen, theme = Settings.Theme.ToString(), inboxEntries = Inbox.Entries.Count,
                 previewOpen = preview.DetailOpen, previewMembers = Inspected?.Members.Length ?? 0,
                 resolvedMembers = Inspected?.Members.Count(m => m.Resolved) ?? 0, lookupBusy = LookupBusy,

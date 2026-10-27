@@ -9,20 +9,59 @@ public sealed partial class Plugin
     private readonly HashSet<ulong> scanAttemptedDetails = [];
     private readonly CollectionQueue socialCollectionQueue = new();
     private readonly HashSet<string> scannedPages = [];
-    private bool socialSweepRequested, scanPageNeedsSnapshot, inspectionSweep;
+    private bool socialSweepRequested, scanPageNeedsSnapshot, inspectionSweep, ownsFinder, profileRefreshPending;
+    private volatile bool openingFinder;
     private int scanStage, completedSweeps, lastSweepPages;
     private string previousPage = "";
     private DateTimeOffset nextScanStep, scanUntil, pageUntil, scanPageDeadline, nextSweepRestart, nextSocialHits, scanReadyUntil, refreshAttemptUntil, scanBlockedSince;
+    private DateTimeOffset profileRefreshUntil, nextProfileAttempt;
     private SocialHit[] cachedSocialHits = [];
     internal bool Scanning { get; private set; }
     internal bool BrowseAll { get; private set; }
     private bool WantsSweep => Settings.WatchContacts || BrowseAll || inspectionSweep;
+    private bool CanStartSweep(DateTimeOffset now) => WantsSweep && !Scanning && !Joining && !profileRefreshPending &&
+        !preview.DetailOpen && !windows.NativeFinderInteracting && !native.AdventurerPlateOpen() && now >= nextSweepRestart;
     internal string ScanStatus { get; private set; } = "Contact scanning starts with Watch.";
     internal int InitialRefreshAttempts { get; private set; }
     internal bool? LastInitialRefreshAccepted { get; private set; }
     internal int ScannedListings => socialListings.Count;
     internal int ScannedRosters => socialListings.Keys.Count(preview.Parties.ContainsKey);
     private void ResetSocialHits() { cachedSocialHits = []; nextSocialHits = default; }
+    private void OpenFinderForWork()
+    {
+        if (native.FinderActive) return;
+        openingFinder = true;
+        if (preview.Quiet(native.Open)) ownsFinder = true;
+        else openingFinder = false;
+    }
+    private void CloseFinderIfIdle(DateTimeOffset now)
+    {
+        if (!ownsFinder) return;
+        if (!native.FinderActive && !openingFinder) { ownsFinder = false; return; }
+        if (windows.NativeFinderInteracting || preview.DetailOpen) { ownsFinder = false; return; }
+        if (Scanning || collecting || profileRefreshPending || Joining ||
+            native.AdventurerPlateOpen() || !preview.CanPrefetch(now)) return;
+        preview.Quiet(() => { native.CloseFinder(); return true; });
+        ownsFinder = openingFinder = false;
+    }
+    private void TickProfileRefresh(DateTimeOffset now)
+    {
+        if (Scanning || collecting || Joining || preview.Busy || now < nextRefresh) return;
+        if (!profileRefreshPending)
+        {
+            profileRefreshPending = true; profileRefreshUntil = now.AddSeconds(15); nextProfileAttempt = now.AddMilliseconds(500);
+            OpenFinderForWork();
+        }
+        if (now >= profileRefreshUntil)
+        { profileRefreshPending = false; nextRefresh = now.AddSeconds(10); return; }
+        if (now < nextProfileAttempt) return;
+        if (!native.FinderActive) { OpenFinderForWork(); nextProfileAttempt = now.AddSeconds(2); return; }
+        if (!native.FinderReady) return;
+        nextProfileAttempt = now.AddSeconds(2);
+        if (!preview.Quiet(native.Refresh)) return;
+        profileRefreshPending = false; collecting = true; collectingUntil = now.AddSeconds(3);
+        nextRefresh = now.AddSeconds(10); batch.Clear();
+    }
     internal SocialHit[] SocialHits
     {
         get
@@ -83,11 +122,12 @@ public sealed partial class Plugin
     {
         if (!Active || Joining || Scanning || !WantsSweep) return;
         var now = DateTimeOffset.UtcNow;
+        profileRefreshPending = false;
         Scanning = true; socialSweepRequested = Settings.WatchContacts; scanStage = 0; previousPage = ""; nextScanStep = default;
         InitialRefreshAttempts = 0; LastInitialRefreshAccepted = null; refreshAttemptUntil = scanBlockedSince = default;
         scannedPages.Clear(); scanPageListings.Clear(); scanAttemptedDetails.Clear();
         scanPageNeedsSnapshot = false; scanUntil = now.AddMinutes(20); scanReadyUntil = now.AddSeconds(15); nextRefresh = now.AddSeconds(10);
-        preview.Quiet(() => { native.Open(); return true; });
+        OpenFinderForWork();
         ScanStatus = "Scanning accessible PF pages in short passes.";
     }
     internal void StopScan()
@@ -128,7 +168,7 @@ public sealed partial class Plugin
         var page = native.Page();
         if (page is null)
         {
-            if (scanStage == 0 && now < scanReadyUntil) { nextScanStep = now.AddMilliseconds(500); return; }
+            if (scanStage == 0 && now < scanReadyUntil) { OpenFinderForWork(); nextScanStep = now.AddMilliseconds(500); return; }
             RetrySweep("Native PF page controls unavailable; retrying shortly.", now); return;
         }
         if (scanStage == 0)
@@ -169,7 +209,7 @@ public sealed partial class Plugin
         if (!page.Next)
         {
             lastSweepPages = scannedPages.Count; completedSweeps++;
-            Scanning = false; nextSweepRestart = now.AddSeconds(2); nextRefresh = now.AddSeconds(10);
+            Scanning = false; nextSweepRestart = now.AddSeconds(10); nextRefresh = now.AddSeconds(10);
             ScanStatus = $"Last pass: {lastSweepPages} page(s). New passes keep contacts and search results current.";
             return;
         }

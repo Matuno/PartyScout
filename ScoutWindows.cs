@@ -78,6 +78,7 @@ internal sealed partial class ScoutWindows(Plugin p)
             .Push(ImGuiStyleVar.FrameBorderSize, 0)
             .Push(ImGuiStyleVar.TabRounding, Math.Min(6, C.Rounding) * Scale);
         if (p.View.Open) Anchor();
+        NativePartyOverlay();
         if (MainOpen) Main();
         if (SettingsOpen) Settings();
         if (!EditingSetup && p.Alert.Target is { } target && (C.Alerts || p.Automation)) Alert(target);
@@ -108,7 +109,7 @@ internal sealed partial class ScoutWindows(Plugin p)
         using var transparent = ImRaii.PushColor(ImGuiCol.WindowBg, Vector4.Zero);
         var viewport = ImGui.GetMainViewport();
         var compact = Mode == RibbonMode.Collapsed;
-        var size = (Mode switch { RibbonMode.Collapsed => new Vector2(360, 52), RibbonMode.Half => new Vector2(438, 340), _ => new Vector2(552, 480) }) * Scale;
+        var size = (Mode switch { RibbonMode.Collapsed => new Vector2(392, 52), RibbonMode.Half => new Vector2(438, 340), _ => new Vector2(552, 480) }) * Scale;
         if (compact && p.Alert.Deadline is not null) size.Y += 24 * Scale;
         if (resize || lastSize != size)
         {
@@ -128,7 +129,7 @@ internal sealed partial class ScoutWindows(Plugin p)
             var dockColor = palette.Panel; dockColor.W = C.Opacity;
             using (ImRaii.PushColor(ImGuiCol.ChildBg, dockColor))
             {
-                if (ImGui.BeginChild("ControlDock", new Vector2(Math.Min(344 * Scale, available.X), dockHeight), false,
+                if (ImGui.BeginChild("ControlDock", new Vector2(Math.Min(376 * Scale, available.X), dockHeight), false,
                     ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse))
                 {
                     ImGui.SetWindowFontScale(1);
@@ -231,6 +232,12 @@ internal sealed partial class ScoutWindows(Plugin p)
         ImGui.SameLine();
         if (Toggle(p.Active ? FontAwesomeIcon.Stop : FontAwesomeIcon.Play, "Watch", p.Active,
             p.Active ? "Stop monitoring and cancel actions" : "Start monitoring")) p.Post(p.ToggleMonitoring);
+        ImGui.SameLine();
+        using (ImRaii.PushColor(ImGuiCol.Button, p.ShowNativeFinder ? palette.Active : palette.Control)
+            .Push(ImGuiCol.Text, p.ShowNativeFinder ? Accent : Muted))
+            if (Icon(p.ShowNativeFinder ? FontAwesomeIcon.Eye : FontAwesomeIcon.EyeSlash, "nativeFinder",
+                p.ShowNativeFinder ? "Hide Party Finder windows" : "Show Party Finder windows", new Vector2(ImGui.GetFrameHeight())))
+                p.Post(p.ToggleNativeFinder);
         ImGui.SameLine();
         using (ImRaii.PushColor(ImGuiCol.Button, C.Alerts ? palette.Active : palette.Control)
             .Push(ImGuiCol.Text, C.Alerts ? Accent : Muted))

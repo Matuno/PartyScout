@@ -22,6 +22,12 @@ internal static class SweepPolicy
     internal static bool IsOwnedError(uint id, bool listingPending, bool platePending, bool manualInteraction) =>
         !manualInteraction && (id == 974 && listingPending || id is >= 5855 and <= 5860 && platePending);
 
-    internal static bool IsLateBackground(ulong id, ulong owned, bool recentlyRequested, bool switchTarget) =>
-        id != 0 && owned == 0 && recentlyRequested && !switchTarget;
+    internal static bool PlateInteractionBlocks(bool manualDetail, bool finderInteracting, bool plateOpen) =>
+        plateOpen || finderInteracting && !manualDetail;
+
+    internal static bool OwnedPlatePending(long requested, long owner, bool verified, DateTimeOffset now, DateTimeOffset until) =>
+        verified && requested != 0 && requested == owner && now <= until;
+
+    internal static bool IsLateBackground(ulong id, ulong owned, bool recentlyRequested, bool switchTarget, bool manuallyViewed) =>
+        id != 0 && owned == 0 && recentlyRequested && !switchTarget && !manuallyViewed;
 }

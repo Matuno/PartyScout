@@ -24,7 +24,7 @@ internal sealed class PlayerLookups : IDisposable
         http.DefaultRequestHeaders.UserAgent.ParseAdd("PartyScout/0.1.4");
     }
     public void Dispose() => http.Dispose();
-    internal void Clear() { progressCache.Clear(); parseCache.Clear(); token = null; tokenCredentials = null; }
+    internal void Clear() { lock (progressCache) progressCache.Clear(); parseCache.Clear(); token = null; tokenCredentials = null; }
 
     private async Task<HttpResponseMessage> Send(Func<HttpRequestMessage> request, CancellationToken ct)
     {
@@ -101,7 +101,8 @@ internal sealed class PlayerLookups : IDisposable
     internal async Task<TomestoneCharacterInfo> Tomestone(PreviewMember member, string duty, Credentials credentials, CancellationToken ct)
     {
         var key = (member.World, member.Name, duty);
-        if (progressCache.TryGetValue(key, out var cached) && cached.Until > DateTimeOffset.UtcNow) return cached.Data;
+        lock (progressCache)
+            if (progressCache.TryGetValue(key, out var cached) && cached.Until > DateTimeOffset.UtcNow) return cached.Data;
         var info = new TomestoneCharacterInfo();
         var (encounter, fallback) = TomestoneData.Encounter(duty);
         var character = Uri.EscapeDataString(member.World) + "/" + Uri.EscapeDataString(member.Name);
@@ -152,8 +153,11 @@ internal sealed class PlayerLookups : IDisposable
         ct.ThrowIfCancellationRequested();
         if (!info.LookupFailed)
         {
-            if (progressCache.Count >= 2048) progressCache.Clear();
-            progressCache[key] = (DateTimeOffset.UtcNow.AddMinutes(5), info);
+            lock (progressCache)
+            {
+                if (progressCache.Count >= 2048) progressCache.Clear();
+                progressCache[key] = (DateTimeOffset.UtcNow.AddMinutes(5), info);
+            }
         }
         return info;
     }

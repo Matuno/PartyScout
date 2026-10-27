@@ -5,6 +5,7 @@ namespace PartyScout;
 public sealed partial class Plugin
 {
     private volatile Match? joining;
+    private Listing? confirmedJoinListing;
     private int joinStep;
     private bool joinAutomatic, confirmed, joinDetailRequested;
     private long sourcePartyId;
@@ -27,7 +28,7 @@ public sealed partial class Plugin
         }
         if (Scanning) PauseScan("Contact scanning paused during the party switch.");
         preview.Quiet(() => { preview.Pause(true); return true; }); CancelLookups();
-        joining = match; joinAutomatic = automatic; joinStep = 0; confirmed = joinDetailRequested = false;
+        joining = match; confirmedJoinListing = null; joinAutomatic = automatic; joinStep = 0; confirmed = joinDetailRequested = false;
         sourcePartyId = View.Party.PartyId; sourceLeader = View.Party.Leader; sourceMembers = View.Party.Jobs.Length;
         nextJoinAllowed = now.AddSeconds(30); joinUntil = now.AddSeconds(20); nextStep = now;
         Inbox.Remove(match.Listing.Id); Alert.Dismiss(); DismissToast(); Status = "Checking target party…";
@@ -42,6 +43,8 @@ public sealed partial class Plugin
         nextStep = now.AddMilliseconds(750);
         if (joinStep == 0 || joinStep == 3)
         {
+            OpenFinderForWork();
+            if (!native.FinderReady) return;
             joinStep = joinStep == 0 ? 1 : 4;
             if (native.HasOtherDialog) { CancelJoin("Target listing could not be opened."); return; }
             var opened = preview.Quiet(() => native.OpenListing(target.Listing.Id));
@@ -59,6 +62,7 @@ public sealed partial class Plugin
                 checkedMatch is null || !checkedMatch.PlayableJobs.Contains(View.CurrentJob) ||
                 joinAutomatic && View.Party.InParty && (CurrentScore is not { } baseline || checkedMatch.Score <= baseline))
             { CancelJoin("The target changed or no longer matches. No further action taken."); return; }
+            confirmedJoinListing = detail;
             if (joinStep == 1 && View.Party.InParty)
             {
                 if (View.Party.PartyId != sourcePartyId || View.Party.Leader != sourceLeader || View.Party.Jobs.Length != sourceMembers || native.HasOtherDialog)
@@ -80,6 +84,7 @@ public sealed partial class Plugin
             if (View.Party.InParty)
             {
                 var success = View.Party.Leader == target.Listing.Leader;
+                if (success) RememberJoinedParty(confirmedJoinListing ?? target.Listing);
                 FinishJoin(false);
                 if (!success) Automation = false;
                 ActionStatus(success ? "Joined the selected party." : "Party changed. Auto-join paused; check your party.");
@@ -92,7 +97,7 @@ public sealed partial class Plugin
     {
         if (joining is not { } target) return;
         preview.Quiet(() => { native.ReleaseJoinWindows(target.Listing.Id, cancel, joinStep == 5, joinDetailRequested); return true; });
-        joining = null;
+        joining = null; confirmedJoinListing = null;
     }
     private void CancelJoin(string reason) { FinishJoin(true); Automation = false; ActionStatus(reason); }
 }

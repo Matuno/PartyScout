@@ -6,6 +6,15 @@ public enum RibbonMode { Collapsed, Half, Open }
 public enum ColourScheme { Grey, Teal, Adaptive }
 public enum ListingEmphasis { Composition, Performance, Description }
 
+internal static class FinderVisibility
+{
+    internal static bool HideFinder(bool active, bool show) => active && !show;
+    internal static bool HideDetail(bool active, bool show, bool background, bool joining) =>
+        active && (!show || background || joining);
+    internal static bool ShowDetailOverlay(bool active, bool show, bool joining, bool background, ulong visible, ulong manual) =>
+        visible != 0 && visible == manual && (!active || show) && !joining && !background;
+}
+
 internal sealed record RibbonPalette(Vector4 Background, Vector4 Panel, Vector4 Control, Vector4 Hover, Vector4 Border,
     Vector4 Text, Vector4 Muted, Vector4 Accent, Vector4 Active, Vector4 Good)
 {
@@ -66,19 +75,17 @@ internal sealed class AlertInbox
     internal void Clear() => entries.Clear();
 }
 
-internal sealed record PhaseAverage(double? Average, int Coverage, int Total);
 internal static class RosterSummary
 {
-    internal static PhaseAverage[] Averages(IEnumerable<MemberData?> members, int occupied)
+    internal static string PlayerAverage(MemberData? data)
     {
-        var data = members.ToArray();
-        var phases = Math.Max(1, data.Select(d => d?.Parses?.Length ?? 0).DefaultIfEmpty().Max());
-        return Enumerable.Range(0, phases).Select(phase =>
+        if (data?.ParseError is not null || data?.Parses is not { Length: > 0 } parts) return "—";
+        return string.Join(" / ", parts.Select((part, i) =>
         {
-            var values = data.Where(d => d?.ParseError is null).Select(d => d?.Parses?.ElementAtOrDefault(phase)?.Average)
-                .OfType<double>().Where(v => double.IsFinite(v) && v is >= 0 and <= 100).ToArray();
-            return new PhaseAverage(values.Length == 0 ? null : values.Average(), values.Length, occupied);
-        }).ToArray();
+            var zoneOnly = parts.Length == 1 && part.Average is null && part.LatestZoneAverage.HasValue;
+            var value = part.Failed ? null : zoneOnly ? part.LatestZoneAverage : part.Average;
+            return (parts.Length > 1 ? $"P{i + 1} " : zoneOnly ? "Z " : "") + (value?.ToString("0.0") ?? "—");
+        }));
     }
     internal static bool FullClear(MemberData? data) =>
         data?.ProgressError is null && data?.Progress is { } progress && progress.Phase != "P1" && (progress.Cleared || progress.TotalClears > 0) ||
