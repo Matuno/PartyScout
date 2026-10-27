@@ -28,6 +28,7 @@ public sealed partial class Plugin : IDalamudPlugin
     private readonly IDalamudPluginInterface pi;
     private readonly IFramework framework;
     private readonly IClientState client;
+    private readonly IPlayerState player;
     private readonly ICondition conditions;
     private readonly IPartyFinderGui pf;
     private readonly ICommandManager commands;
@@ -83,7 +84,7 @@ public sealed partial class Plugin : IDalamudPlugin
         ICondition condition, IPartyFinderGui partyFinder, ICommandManager commandManager, IPluginLog log,
         IGameGui gui, IPartyList party, IPlayerState player, IDataManager data, INotificationManager notificationManager, IGameInteropProvider interop, ITextureProvider textures, IChatGui chatGui, IAddonLifecycle addonLifecycle)
     {
-        pi = pluginInterface; this.framework = framework; client = clientState; conditions = condition; pf = partyFinder;
+        pi = pluginInterface; this.framework = framework; client = clientState; this.player = player; conditions = condition; pf = partyFinder;
         commands = commandManager; this.log = log; notifications = notificationManager; chat = chatGui; this.addonLifecycle = addonLifecycle;
         Textures = textures;
         Settings = pi.GetPluginConfig() as Configuration ?? new Configuration();
@@ -168,7 +169,7 @@ public sealed partial class Plugin : IDalamudPlugin
         Active = Automation = false; collecting = false;
         pf.ReceiveListing -= Receive; Alert.Reset(); Inbox.Clear(); DismissToast();
         preview.Quiet(() => { native.FinishFinderShow(); native.SetHidden(false); if (closeNative && wasActive) native.Close(); preview.Stop(); return true; });
-        CancelLookups(true); Scanning = socialSweepRequested = BrowseAll = inspectionSweep = false; socialListings.Clear(); ResetSocialHits(); scanPageListings.Clear(); scanAttemptedDetails.Clear(); socialCollectionQueue.Clear(); scannedPages.Clear();
+        CancelLookups(true); ClearCompanyRoster(); Scanning = socialSweepRequested = BrowseAll = inspectionSweep = false; socialListings.Clear(); ResetSocialHits(); scanPageListings.Clear(); scanAttemptedDetails.Clear(); socialCollectionQueue.Clear(); scannedPages.Clear();
         Status = reason;
         listings.Clear(); batch.Clear(); Matches = []; OverviewMatches = []; OverviewListings = []; CurrentListing = null;
         while (incoming.TryDequeue(out _)) { }
@@ -389,11 +390,11 @@ public sealed partial class Plugin : IDalamudPlugin
         framework.Update -= Update; pf.ReceiveListing -= Receive; chat.LogMessage -= OnLogMessage; addonLifecycle.UnregisterListener(OnFinderLifecycle); addonLifecycle.UnregisterListener(OnJoinLifecycle);
         pi.UiBuilder.Draw -= Draw; pi.UiBuilder.OpenMainUi -= OpenMain; pi.UiBuilder.OpenConfigUi -= OpenSettings;
         commands.RemoveHandler("/partyscout"); runTests.UnregisterFunc(); listTests.UnregisterFunc(); DismissToast();
-        lookupCancellation?.Cancel();
+        lookupCancellation?.Cancel(); companyCancellation?.Cancel();
         void ReleaseNative() { FinishJoin(true); preview.Quiet(() => { native.FinishFinderShow(); native.SetHidden(false); preview.Dispose(); return true; }); }
         if (framework.IsInFrameworkUpdateThread) ReleaseNative();
         else framework.Run(ReleaseNative).GetAwaiter().GetResult();
-        lookupTask?.GetAwaiter().GetResult(); lookupCancellation?.Dispose(); lookups.Clear(); lookups.Dispose();
+        lookupTask?.GetAwaiter().GetResult(); companyTask?.GetAwaiter().GetResult(); lookupCancellation?.Dispose(); companyCancellation?.Dispose(); lookups.Clear(); lookups.Dispose();
     }
     private string Smoke(string json)
     {
@@ -428,7 +429,7 @@ public sealed partial class Plugin : IDalamudPlugin
                 nativeFinderHovered = windows.NativeFinderHovered, nativeFinderInteracting = windows.NativeFinderInteracting, initialRefreshAttempts = InitialRefreshAttempts,
                 lastInitialRefreshAccepted = LastInitialRefreshAccepted,
                 scannedListings = socialListings.Count, scannedRosters = ScannedRosters,
-                contactWatch = Settings.WatchContacts, completedSweeps, lastSweepPages,
+                contactWatch = Settings.WatchContacts, companyMembers = companyRoster.Count, companyBusy = CompanyBusy, companyStatus, completedSweeps, lastSweepPages,
                 quietAudioAvailable = preview.QuietAudioAvailable, quietListingError, quietPlateErrors,
                 suppressedListingErrors = preview.SuppressedListingErrors, suppressedPlateErrors = preview.SuppressedPlateErrors,
                 suppressedSounds = preview.SuppressedSounds, passedThroughSounds = preview.PassedThroughSounds,

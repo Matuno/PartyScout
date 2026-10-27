@@ -102,7 +102,7 @@ public sealed partial class Plugin
         nextSweepRestart = DateTimeOffset.UtcNow.AddSeconds(2);
         ScanStatus = reason;
     }
-    internal void RefreshSocialRosters() { if (Active) { preview.Quiet(() => { native.RefreshSocial(); return true; }); nextSocialRead = default; } }
+    internal void RefreshSocialRosters() { if (Active) { preview.Quiet(() => { native.RefreshSocial(); return true; }); nextSocialRead = default; RefreshCompanyRoster(); } }
     private bool PageCollectionPending(DateTimeOffset now)
     {
         var visible = native.PageListingIds();

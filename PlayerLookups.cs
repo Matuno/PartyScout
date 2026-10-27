@@ -52,6 +52,52 @@ internal sealed class PlayerLookups : IDisposable
         _ => $"Provider returned HTTP {(int)status}; try later.",
     };
 
+    internal async Task<string[]> FreeCompany(string name, string world, ulong company, CancellationToken ct)
+    {
+        const string origin = "https://na.finalfantasyxiv.com";
+        async Task<string> Fetch(string path)
+        {
+            using var response = await Send(() => new HttpRequestMessage(HttpMethod.Get, origin + path), ct).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode) throw new InvalidOperationException(Failure(response.StatusCode));
+            return await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        }
+        async Task Pause() => await Task.Delay(500, ct).ConfigureAwait(false);
+
+        if (company == 0)
+        {
+            var search = "/lodestone/character/?q=" + Uri.EscapeDataString(name) + "&worldname=" + Uri.EscapeDataString(world);
+            var html = await Fetch(search).ConfigureAwait(false);
+            var (pages, total) = LodestoneRoster.Pagination(html, 1, 1000);
+            var entries = new List<(string Name, string World, ulong Company)>();
+            for (var page = 1; page <= pages; page++)
+            {
+                if (page > 1) { await Pause().ConfigureAwait(false); html = await Fetch(search + "&page=" + page).ConfigureAwait(false); }
+                if (LodestoneRoster.Pagination(html, page, 1000) != (pages, total)) throw new InvalidDataException("Character search changed while loading.");
+                entries.AddRange(LodestoneRoster.CharacterPage(html));
+            }
+            var exact = entries.Where(e => e.Name.Equals(name, StringComparison.OrdinalIgnoreCase) && e.World.Equals(world, StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (entries.Count != total || exact.Length != 1 || exact[0].Company == 0)
+                throw new InvalidDataException("Could not identify the current character's free company.");
+            company = exact[0].Company;
+        }
+
+        var basePath = "/lodestone/freecompany/" + company + "/member/?page=";
+        var first = await Fetch(basePath + "1").ConfigureAwait(false);
+        var (memberPages, memberTotal) = LodestoneRoster.Pagination(first, 1, 512);
+        var members = new List<(string Name, string World)>();
+        for (var page = 1; page <= memberPages; page++)
+        {
+            var html = first;
+            if (page > 1) { await Pause().ConfigureAwait(false); html = await Fetch(basePath + page).ConfigureAwait(false); }
+            if (LodestoneRoster.Pagination(html, page, 512) != (memberPages, memberTotal)) throw new InvalidDataException("The free company roster changed while loading.");
+            members.AddRange(LodestoneRoster.MemberPage(html));
+        }
+        if (members.Count != memberTotal || members.Any(m => !m.World.Equals(world, StringComparison.OrdinalIgnoreCase)) ||
+            !members.Any(m => m.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidDataException("The complete free company roster could not be verified.");
+        return members.Select(m => m.Name).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
     internal async Task<TomestoneCharacterInfo> Tomestone(PreviewMember member, string duty, Credentials credentials, CancellationToken ct)
     {
         var key = (member.World, member.Name, duty);

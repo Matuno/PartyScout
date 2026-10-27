@@ -25,7 +25,8 @@ public sealed partial class Plugin
     internal bool LookupBusy => lookupTask is { IsCompleted: false };
     internal string LookupStatus { get; private set; } = "Collecting matched parties in the background.";
     internal string CredentialStatus { get; private set; } = "";
-    internal string SocialRosterStatus { get; private set; } = "Social rosters have not been read.";
+    private string nativeSocialStatus = "Social rosters have not been read.";
+    internal string SocialRosterStatus => nativeSocialStatus + (Settings.WatchFreeCompany ? " · " + companyStatus : "");
     internal bool HasTomestone => credentials.HasTomestone;
     internal bool HasFFLogs => credentials.HasFFLogs;
     internal string CollectionDiagnostics => $"Collected parties: {preview.Parties.Count} · Data rows: {memberData.Count} · Native request: {preview.Busy}\n{LookupStatus}\n{ScanStatus}";
@@ -36,7 +37,7 @@ public sealed partial class Plugin
         return detail is not null && latest is not null && !CollectionQueue.Compatible(latest, detail) ? null : detail;
     }
     internal MemberData? DataFor(PreviewMember member, uint duty) => memberData.GetValueOrDefault(Inspection.MemberKey(member, duty));
-    internal SocialKind Relation(PreviewMember member) => Social.Match(member, socialPeople, Settings);
+    internal SocialKind Relation(PreviewMember member) => Social.Match(member, socialPeople, Settings, companyRoster);
     internal string InspectedDuty => Inspected is { } d ? DutyLabel(d.Duty) : "";
     internal string DutyLabel(uint duty) => DutyChoices.FirstOrDefault(d => d.Id == duty).Name ?? "Select duty";
 
@@ -66,6 +67,7 @@ public sealed partial class Plugin
     {
         if (now < nextCollection) return;
         nextCollection = now.AddMilliseconds(200);
+        if ((!Settings.WatchContacts || !Settings.WatchFreeCompany) && CompanyBusy) CancelCompanyLookup();
         if (now >= nextSocialRead)
         {
             nextSocialRead = now.AddSeconds(10);
@@ -76,8 +78,9 @@ public sealed partial class Plugin
                 preview.Remember(person.Id, person.Name, person.World);
             }
             var fcCount = roster.People.Count(p => p.Kind == SocialKind.FreeCompany);
-            SocialRosterStatus = $"Friends {roster.People.Count(p => p.Kind == SocialKind.Friend)} · " +
-                (roster.FreeCompanyVerified ? $"FC {fcCount}/{(roster.FreeCompanyTotal > 0 ? roster.FreeCompanyTotal.ToString() : "?")}" : "FC unavailable — open your FC Members once, then refresh rosters.");
+            nativeSocialStatus = $"Friends {roster.People.Count(p => p.Kind == SocialKind.Friend)} · " +
+                (roster.FreeCompanyVerified ? $"FC native {fcCount}/{(roster.FreeCompanyTotal > 0 ? roster.FreeCompanyTotal.ToString() : "?")}" : "FC native unavailable");
+            UpdateCompanyRoster(now, roster.FreeCompanyId);
         }
         preview.Tick(now);
         if (inspectionSweep && (selectedListing == 0 ||
@@ -130,7 +133,8 @@ public sealed partial class Plugin
         var matched = Matches.Select(m => Collected(m.Listing.Id)).OfType<PartyDetail>()
             .Concat(socialSweepRequested ? socialListings.Values.Where(l => l.Expires > now && filter.Evaluate(l, l.Seen) is not null).Select(l => Collected(l.Id)).OfType<PartyDetail>() : [])
             .Concat(new[] { CurrentParty, Inspected }.OfType<PartyDetail>()).DistinctBy(p => p.Id).ToArray();
-        var resolve = Settings.CustomFriends.Count > 0 && socialSweepRequested ? matched.Concat(preview.Parties.Values).DistinctBy(p => p.Id) : matched;
+        var resolve = socialSweepRequested && (Settings.CustomFriends.Count > 0 || Settings.WatchFreeCompany && companyRoster.Count > 0)
+            ? matched.Concat(socialListings.Values.Where(l => SweepPolicy.ShowContact(l, now)).Select(l => Collected(l.Id)).OfType<PartyDetail>()).DistinctBy(p => p.Id) : matched;
         preview.ResolveNext(resolve, now);
         if (!LookupBusy)
             foreach (var detail in matched.OrderByDescending(d => d.Id == selectedListing)

@@ -19,11 +19,14 @@ internal static class Social
     }
     internal static bool Recent(DateTimeOffset seen, DateTimeOffset now) => now - seen < TimeSpan.FromMinutes(2);
 
-    internal static SocialKind Match(PreviewMember member, IReadOnlyDictionary<ulong, SocialPerson> known, Settings settings)
+    internal static SocialKind Match(PreviewMember member, IReadOnlyDictionary<ulong, SocialPerson> known, Settings settings,
+        IReadOnlySet<(string Name, ushort World)>? company = null)
     {
         var kind = known.TryGetValue(member.Id, out var person) ? person.Kind : SocialKind.None;
         if (!settings.WatchFriends) kind &= ~SocialKind.Friend;
         if (!settings.WatchFreeCompany) kind &= ~SocialKind.FreeCompany;
+        else if (member.Name.Length > 0 && member.WorldId > 0 && company?.Contains((member.Name.Trim().ToUpperInvariant(), member.WorldId)) == true)
+            kind |= SocialKind.FreeCompany;
         if (member.Resolved && settings.CustomFriends.Any(p => p.World == member.WorldId && p.Name.Trim().Equals(member.Name, StringComparison.OrdinalIgnoreCase))) kind |= SocialKind.Custom;
         return kind;
     }

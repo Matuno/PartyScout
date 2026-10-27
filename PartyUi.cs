@@ -397,6 +397,7 @@ internal sealed partial class ScoutWindows
     {
         if (ImGui.Checkbox("Friends", ref C.WatchFriends)) p.Post(p.Save);
         ImGui.SameLine(); if (ImGui.Checkbox("FC", ref C.WatchFreeCompany)) p.Post(p.Save);
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Find FC members using the public Lodestone roster, including while visiting another data center.");
         ImGui.SameLine(); using (ImRaii.Disabled(!p.Active || p.Joining))
             if (Toggle(C.WatchContacts ? FontAwesomeIcon.Stop : FontAwesomeIcon.Play, "Sweep", C.WatchContacts && p.Active, "Continuously scan native DC / All pages for contacts while monitoring search profiles."))
                 p.Post(C.WatchContacts ? p.StopScan : p.StartScan);

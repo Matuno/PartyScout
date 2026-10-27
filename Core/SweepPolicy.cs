@@ -2,6 +2,9 @@ namespace PartyScout.Core;
 
 internal static class SweepPolicy
 {
+    internal static HashSet<ulong> PageListingIds(ReadOnlySpan<ulong> ids, int count) =>
+        ids[..Math.Clamp(count, 0, ids.Length)].ToArray().Where(id => id != 0).ToHashSet();
+
     internal static bool OnPage(Listing listing, IReadOnlySet<ulong> visible, DateTimeOffset now) =>
         visible.Contains(listing.Id) && listing.Fresh(now);
 

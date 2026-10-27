@@ -11,7 +11,7 @@ namespace PartyScout;
 internal sealed record PartySnapshot(bool InParty, ulong Leader, byte[] Jobs, long PartyId, bool Alliance);
 internal sealed record NativeView(bool Open, Vector2 FinderPosition, Vector2 FinderSize, PartySnapshot Party, uint CurrentJob);
 internal sealed record FinderPage(byte Area, byte Category, string Key, bool Previous, bool Next, int ExpectedListings);
-internal sealed record SocialRoster(SocialPerson[] People, bool FreeCompanyVerified, int FreeCompanyTotal);
+internal sealed record SocialRoster(SocialPerson[] People, bool FreeCompanyVerified, int FreeCompanyTotal, ulong FreeCompanyId);
 
 // All methods run on IFramework; no native pointer survives a call.
 internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, IPlayerState player)
@@ -387,13 +387,13 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
         }
         Read((InfoProxyCommonList*)InfoProxyFriendList.Instance(), SocialKind.Friend, 200);
         var fc = InfoProxyFreeCompanyMember.Instance();
-        // shortcut: FC coverage uses loaded native entries; add full roster fetching when the SDK models verified pagination.
         var start = result.Count;
         Read((InfoProxyCommonList*)fc, SocialKind.FreeCompany, 200);
-        var verified = result.Skip(start).Any(m => m.Id == player.ContentId);
-        if (!verified) result.RemoveRange(start, result.Count - start);
         var company = InfoProxyFreeCompany.Instance();
-        return new(result.ToArray(), verified, verified && company != null && fc != null && company->Id == fc->FreeCompanyId ? company->TotalMembers : 0);
+        var verified = fc != null && company != null && fc->FreeCompanyId != 0 && company->Id == fc->FreeCompanyId &&
+            result.Skip(start).Any(m => m.Id == player.ContentId);
+        if (!verified) result.RemoveRange(start, result.Count - start);
+        return new(result.ToArray(), verified, verified ? company->TotalMembers : 0, verified ? fc->FreeCompanyId : 0);
     }
     internal void RefreshSocial()
     {
@@ -411,7 +411,16 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
     {
         var agent = AgentLookingForGroup.Instance();
         if (agent == null) return [];
-        return agent->Listings.ListingIds.ToArray().Take(Math.Min((int)agent->NumberOfListingsDisplayed, 50)).Where(id => id != 0).ToHashSet();
+        ReadOnlySpan<ulong> mapped = agent->Listings.ListingIds;
+        var count = agent->NumberOfListingsDisplayed;
+        // The SDK maps 50 IDs, but the 800-byte buffer also holds expanded 100-listing pages.
+        fixed (ulong* first = mapped)
+        {
+            if (count > mapped.Length && count <= 100 && mapped.Length == 50 &&
+                sizeof(AgentLookingForGroup.ListingsSub) == 100 * sizeof(ulong) && (void*)first == &agent->Listings)
+                return SweepPolicy.PageListingIds(new ReadOnlySpan<ulong>(first, count), count);
+        }
+        return SweepPolicy.PageListingIds(mapped, count);
     }
     internal bool AdventurerPlateOpen()
     {
