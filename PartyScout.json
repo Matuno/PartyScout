@@ -1,0 +1,12 @@
+{
+  "Author": "Matuno",
+  "Name": "Party Scout",
+  "Punchline": "Find the right party and see who's playing.",
+  "Description": "Find Party Finder groups that match your goals, see their members and progress, and spot friends. Get alerts or opt in to automatic party switching.",
+  "IconUrl": "https://raw.githubusercontent.com/Matuno/DalamudPlugins/main/plugins/PartyScout/icon.png",
+  "ApplicableVersion": "any",
+  "Tags": [
+    "party finder",
+    "alerts"
+  ]
+}
