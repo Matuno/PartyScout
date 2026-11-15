@@ -65,7 +65,7 @@ internal sealed class AlertInbox
     internal void Add(Match match, DateTimeOffset now)
     {
         var old = entries.FindIndex(e => e.Match.Listing.Id == match.Listing.Id);
-        if (old >= 0 && entries[old].Match.Score >= match.Score) return;
+        if (old >= 0 && entries[old].Match.Rank >= match.Rank && entries[old].Match.UsesJobPreferences == match.UsesJobPreferences) return;
         if (old >= 0) entries.RemoveAt(old);
         entries.Insert(0, new(match, now));
         if (entries.Count > Capacity) entries.RemoveAt(entries.Count - 1);

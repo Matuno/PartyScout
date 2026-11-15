@@ -15,8 +15,7 @@ internal sealed class CollectionQueue
         }
         foreach (var l in wanted.OrderBy(LastVisit))
         {
-            var upToDate = collected.TryGetValue(l.Id, out var detail) && IsFresh(l, detail, now);
-            if (!upToDate && (!attempted.TryGetValue(l.Id, out var last) || now - last >= TimeSpan.FromSeconds(15)))
+            if (CanRequest(l, collected, now))
             {
                 if (attempted.Count >= 1000 && !attempted.ContainsKey(l.Id)) attempted.Remove(attempted.MinBy(pair => pair.Value).Key);
                 attempted[l.Id] = now; return l.Id;
@@ -24,6 +23,9 @@ internal sealed class CollectionQueue
         }
         return 0;
     }
+    internal bool CanRequest(Listing listing, IReadOnlyDictionary<ulong, PartyDetail> collected, DateTimeOffset now) =>
+        listing.Expires > now && (!collected.TryGetValue(listing.Id, out var detail) || !IsFresh(listing, detail, now)) &&
+        (!attempted.TryGetValue(listing.Id, out var last) || now - last >= TimeSpan.FromSeconds(15));
     internal void Clear() => attempted.Clear();
     internal static bool IsFresh(Listing listing, PartyDetail? detail, DateTimeOffset now) =>
         detail is not null && now - detail.Collected < TimeSpan.FromSeconds(60) && Compatible(listing, detail);

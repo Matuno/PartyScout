@@ -32,9 +32,51 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
     private short previousShowSoundEffectId;
     private string previousFocusName = "";
     private ushort previousFocusId;
+    private readonly Dictionary<string, (ushort Id, bool Window, bool Header)> hiddenInputs = new(StringComparer.Ordinal);
     public bool Hidden => hiddenAddon != 0;
     internal bool ManualDetailHidden => hiddenManualDetail != 0;
     private AtkUnitBase* Addon(string name) => (AtkUnitBase*)gui.GetAddonByName(name).Address;
+    private void SetRootVisible(AtkUnitBase* addon, bool visible)
+    {
+        if (addon == null || addon->RootNode == null) return;
+        var changed = addon->RootNode->IsVisible() != visible;
+        if (!visible)
+        {
+            var name = addon->NameString;
+            if (!hiddenInputs.TryGetValue(name, out var saved) || saved.Id != addon->Id)
+                hiddenInputs[name] = (addon->Id, addon->WindowCollisionNode != null && addon->WindowCollisionNode->AtkResNode.IsVisible(),
+                    addon->WindowHeaderCollisionNode != null && addon->WindowHeaderCollisionNode->AtkResNode.IsVisible());
+            if (addon->WindowCollisionNode != null)
+            {
+                changed |= addon->WindowCollisionNode->AtkResNode.IsVisible();
+                addon->WindowCollisionNode->AtkResNode.ToggleVisibility(false);
+            }
+            if (addon->WindowHeaderCollisionNode != null)
+            {
+                changed |= addon->WindowHeaderCollisionNode->AtkResNode.IsVisible();
+                addon->WindowHeaderCollisionNode->AtkResNode.ToggleVisibility(false);
+            }
+        }
+        else changed |= RestoreInput(addon);
+        addon->RootNode->ToggleVisibility(visible);
+        if (changed) addon->UpdateCollisionNodeList(false);
+    }
+    private bool RestoreInput(AtkUnitBase* addon)
+    {
+        if (addon == null || !hiddenInputs.Remove(addon->NameString, out var saved) || saved.Id != addon->Id) return false;
+        if (addon->WindowCollisionNode != null) addon->WindowCollisionNode->AtkResNode.ToggleVisibility(saved.Window);
+        if (addon->WindowHeaderCollisionNode != null) addon->WindowHeaderCollisionNode->AtkResNode.ToggleVisibility(saved.Header);
+        return true;
+    }
+    internal void RestoreHiddenInputs()
+    {
+        foreach (var name in hiddenInputs.Keys.ToArray())
+        {
+            var addon = Addon(name);
+            if (RestoreInput(addon) && addon->IsReady) addon->UpdateCollisionNodeList(false);
+        }
+        hiddenInputs.Clear();
+    }
     private static AtkUnitBase* AddonById(uint id, string name)
     {
         var stage = AtkStage.Instance();
@@ -143,13 +185,13 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
             {
                 if (hiddenAddon == 0 && !addon->RootNode->IsVisible()) return;
                 hiddenAddon = addon->Id;
-                addon->RootNode->ToggleVisibility(false);
+                SetRootVisible(addon, false);
             }
             return;
         }
         if (hiddenAddon != 0)
         {
-            if (addon->Id == hiddenAddon && addon->RootNode != null) addon->RootNode->ToggleVisibility(true);
+            if (addon->Id == hiddenAddon && addon->RootNode != null) SetRootVisible(addon, true);
             hiddenAddon = 0;
         }
     }
@@ -160,7 +202,7 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
         if (!hide)
         {
             if (hiddenManualDetail != 0 && addon != null && addon->Id == hiddenManualDetail &&
-                listing == hiddenManualListing && addon->RootNode != null) addon->RootNode->ToggleVisibility(true);
+                listing == hiddenManualListing && addon->RootNode != null) SetRootVisible(addon, true);
             hiddenManualDetail = 0; hiddenManualListing = 0;
             return;
         }
@@ -169,14 +211,14 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
         { hiddenManualDetail = 0; hiddenManualListing = 0; }
         if (!addon->RootNode->IsVisible()) return;
         hiddenManualDetail = addon->Id; hiddenManualListing = listing;
-        addon->RootNode->ToggleVisibility(false); RestoreFocus(addon);
+        SetRootVisible(addon, false); RestoreFocus(addon);
     }
     public void Close()
     {
         SetHidden(false);
         foreach (var name in new[] { "LookingForGroupDetail", "LookingForGroup" })
         {
-            var a = Addon(name); if (a != null && a->IsVisible) a->Close(true);
+            var a = Addon(name); if (a != null && a->IsVisible) { RestoreInput(a); a->Close(true); }
         }
     }
     internal void CloseFinder()
@@ -203,15 +245,7 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
         var agent = AgentLookingForGroup.Instance();
         var addon = Addon("LookingForGroupDetail");
         if (agent == null || addon == null || !addon->IsReady || !addon->IsVisible) return null;
-        ref var d = ref agent->LastViewedListing;
-        if (d.ListingId != id || d.TotalSlots is < 1 or > 48 || d.SlotsFilled > d.TotalSlots) return null;
-        return new Listing(d.ListingId, d.LeaderContentId, d.DutyId, true, d.CommentString,
-            d.TotalSlots, d.SlotsFilled, d.Jobs.ToArray(), d.SlotFlags.ToArray(),
-            (d.JoinConditionFlags & AgentLookingForGroup.JoinCondition.OnePlayerPerJob) != 0,
-            (d.JoinConditionFlags & AgentLookingForGroup.JoinCondition.Private) != 0,
-            d.NumberOfParties, d.AvgItemLv, now, now.AddSeconds(Math.Min(d.TimeLeft, 3600)))
-        { Host = d.LeaderString, HomeWorld = d.HomeWorld, Objective = (byte)d.Objective, Conditions = (byte)d.CompletionStatus,
-            DutySettings = (byte)d.DutyFinderSettingFlags, Loot = (byte)d.LootRule, Languages = (byte)d.LanguageFlags, Beginners = d.BeginnerFriendly != 0 };
+        return agent->LastViewedListing.ListingId == id ? CopyDetail(&agent->LastViewedListing, now)?.Recruitment : null;
     }
 
     internal static PartyDetail? CopyDetail(AgentLookingForGroup.Detailed* data, DateTimeOffset now)
@@ -244,8 +278,8 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
     internal void HideBackgroundDetail(ulong id)
     {
         var addon = Addon("LookingForGroupDetail");
-        if (VisibleDetailId != id || addon == null || addon->RootNode == null) return;
-        hiddenDetail = addon->Id; addon->RootNode->ToggleVisibility(false);
+        if (!SweepPolicy.OwnsDetail(id, VisibleDetailId) || addon == null || addon->RootNode == null) return;
+        hiddenDetail = addon->Id; SetRootVisible(addon, false);
         RestoreFocus(addon);
     }
     private void RestoreFocus(AtkUnitBase* addon)
@@ -303,7 +337,7 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
         ref var hidden = ref (name == "LookingForGroupDetail" ? ref hiddenJoinDetail : ref hiddenJoinConfirmation);
         if (hidden == 0 && !addon->RootNode->IsVisible()) return;
         hidden = addon->Id;
-        addon->RootNode->ToggleVisibility(false);
+        SetRootVisible(addon, false);
         RestoreFocus(addon);
     }
     internal void HideJoinDetail(ulong target)
@@ -321,19 +355,21 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
         var confirmation = AddonById(confirmationId, "SelectYesno");
         if (confirmation != null && confirmation->IsVisible && confirmation->RootNode != null)
         {
+            RestoreInput(confirmation);
             var owned = currentAgent != null && JoinPolicy.OwnsConfirmation(target, currentAgent->LastViewedListing.ListingId, currentAgent->JoinConfirmAddonId, confirmation->Id);
             if ((!cancel || !owned || !confirmation->IsReady || !Click(confirmation, ((AddonSelectYesno*)confirmation)->NoButton)) &&
                 confirmationId == hiddenJoinConfirmation)
-                confirmation->RootNode->ToggleVisibility(true);
+                SetRootVisible(confirmation, true);
         }
         hiddenJoinConfirmation = 0;
         var detail = hiddenJoinDetail != 0 ? AddonById(hiddenJoinDetail, "LookingForGroupDetail") :
             requestedDetail && VisibleDetailId == target ? Addon("LookingForGroupDetail") : null;
         if (detail != null && detail->RootNode != null)
         {
+            RestoreInput(detail);
             var agent = AgentLookingForGroup.Instance();
             if (agent != null && agent->LastViewedListing.ListingId == target) detail->Close(true);
-            else detail->RootNode->ToggleVisibility(true);
+            else SetRootVisible(detail, true);
         }
         hiddenJoinDetail = 0;
     }
@@ -363,6 +399,7 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
         var addon = Addon("LookingForGroupDetail");
         if (addon != null && addon->Id == backgroundDetailAddon)
         {
+            RestoreInput(addon);
             addon->DisableShowOnOpen = previousDisableShowOnOpen;
             addon->DisableShowHideSoundEffects = previousDisableShowHideSoundEffects;
             addon->ShowSoundEffectId = previousShowSoundEffectId;
@@ -372,9 +409,10 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
     internal void CloseUnexpectedBackgroundDetail(ulong id)
     {
         var addon = Addon("LookingForGroupDetail");
-        if (addon != null && addon->Id == backgroundDetailAddon && VisibleDetailId == id)
+        if (addon != null && addon->Id == backgroundDetailAddon && SweepPolicy.OwnsDetail(id, VisibleDetailId))
         {
-            if (addon->RootNode != null) addon->RootNode->ToggleVisibility(false);
+            if (addon->RootNode != null) SetRootVisible(addon, false);
+            RestoreInput(addon);
             addon->Close(true);
         }
         hiddenDetail = 0;
@@ -388,8 +426,8 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
         var addonId = addon != null ? addon->Id : (ushort)0;
         if (addon != null && (addon->Id == backgroundDetailAddon || addon->Id == hiddenDetail))
         {
-            if (close) addon->Close(true);
-            else if (addon->Id == hiddenDetail && addon->RootNode != null) addon->RootNode->ToggleVisibility(true);
+            if (close && SweepPolicy.OwnsDetail(id, VisibleDetailId)) { RestoreInput(addon); addon->Close(true); }
+            else if (addon->Id == hiddenDetail && addon->RootNode != null) SetRootVisible(addon, true);
         }
         hiddenDetail = 0;
         RestoreBackgroundDetail();
@@ -480,7 +518,7 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
         var addon = (AddonLookingForGroup*)Addon("LookingForGroup");
         if (addon == null || !addon->IsReady) return false;
         var radio = area ? addon->WorldSelectButtons[0].Value : addon->CategoryButtons[0].Value;
-        return radio != null && radio->SetActive();
+        return radio != null && Click((AtkUnitBase*)addon, (AtkComponentButton*)radio);
     }
     internal bool TurnPage(bool forward)
     {

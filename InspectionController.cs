@@ -22,7 +22,7 @@ public sealed partial class Plugin
     private readonly Dictionary<uint, string> englishDuties;
     private readonly Dictionary<ulong, SocialPerson> socialPeople = [];
     internal PartyDetail? CurrentParty { get; private set; }
-    internal PartyDetail? NativeParty => View.Detail is { } window && FinderVisibility.ShowDetailOverlay(Active, showNativeFinder, Joining, preview.SuppressDetail, window.ListingId, preview.ManualId)
+    internal PartyDetail? NativeParty => View.Detail is { } window && FinderVisibility.ShowDetailOverlay(Running, showNativeFinder, Joining, preview.SuppressDetail, window.ListingId, preview.ManualId)
         ? preview.Parties.GetValueOrDefault(window.ListingId) : null;
     internal PartyDetail? Inspected => Collected(selectedListing);
     internal bool HasInspection => selectedListing != 0;
@@ -44,11 +44,11 @@ public sealed partial class Plugin
     internal MemberData? DataFor(PreviewMember member, uint duty) => memberData.GetValueOrDefault(Inspection.MemberKey(member, duty));
     internal SocialKind Relation(PreviewMember member) => Social.Match(member, socialPeople, Settings, companyRoster);
     internal string InspectedDuty => Inspected is { } d ? DutyLabel(d.Duty) : "";
-    internal string DutyLabel(uint duty) => DutyChoices.FirstOrDefault(d => d.Id == duty).Name ?? "Select duty";
+    internal string DutyLabel(uint duty) => DutyChoices.FirstOrDefault(d => d.Id == duty).Name ?? (duty == 0 ? "Select duty" : $"Duty {duty}");
 
     internal void Inspect(Listing listing)
     {
-        if (!Active || Joining || listing.Expires <= DateTimeOffset.UtcNow) { ActionStatus("Start monitoring and select an available listing to inspect."); return; }
+        if (!Running || Joining || listing.Expires <= DateTimeOffset.UtcNow) { ActionStatus("Start monitoring and select an available listing to inspect."); return; }
         if (selectedListing != listing.Id) CancelLookups();
         selectedListing = listing.Id; nextSelectedRequest = default;
         if (Collected(listing.Id) is null && (!native.FinderReady || !native.PageListingIds().Contains(listing.Id))) RequestInspectionSweep();
@@ -146,8 +146,8 @@ public sealed partial class Plugin
     {
         if (now < nextCollection) return;
         nextCollection = now.AddMilliseconds(200);
-        if ((!Settings.WatchContacts || !Settings.WatchFreeCompany) && CompanyBusy) CancelCompanyLookup();
-        if (now >= nextSocialRead)
+        if ((!ContactActive || !Settings.WatchFreeCompany) && CompanyBusy) CancelCompanyLookup();
+        if (ContactActive && now >= nextSocialRead)
         {
             nextSocialRead = now.AddSeconds(10);
             var roster = native.ReadSocial(); socialPeople.Clear();
@@ -203,15 +203,15 @@ public sealed partial class Plugin
         }
         var manual = NativeParty;
         var matched = Matches.Select(m => Collected(m.Listing.Id)).OfType<PartyDetail>()
-            .Concat(socialSweepRequested ? socialListings.Values.Where(l => l.Expires > now && filter.Evaluate(l, l.Seen) is not null).Select(l => Collected(l.Id)).OfType<PartyDetail>() : [])
-            .Concat(new[] { CurrentParty, Inspected, manual }.OfType<PartyDetail>()).DistinctBy(p => p.Id).ToArray();
+            .Concat(Active && socialSweepRequested ? socialListings.Values.Where(l => l.Expires > now && filter.Evaluate(l, l.Seen) is not null).Select(l => Collected(l.Id)).OfType<PartyDetail>() : [])
+            .Concat(new[] { Active ? CurrentParty : null, windows.MainOpen ? Inspected : null, manual }.OfType<PartyDetail>()).DistinctBy(p => p.Id).ToArray();
         var resolve = socialSweepRequested && (Settings.CustomFriends.Count > 0 || Settings.WatchFreeCompany && companyRoster.Count > 0)
             ? matched.Concat(socialListings.Values.Where(l => SweepPolicy.ShowContact(l, now)).Select(l => Collected(l.Id)).OfType<PartyDetail>()).DistinctBy(p => p.Id) : matched;
         if (manual is not null) preview.ResolveNext([manual], now, manualDetail: true);
         preview.ResolveNext(resolve, now);
         if (!LookupBusy)
-            foreach (var detail in matched.OrderByDescending(d => d.Id == selectedListing)
-                .ThenBy(d => d.Members.Where(m => m.Resolved).Select(m => DataFor(m, d.Duty)?.ProgressAt ?? DateTimeOffset.MinValue).DefaultIfEmpty().Min()))
+            foreach (var detail in Inspection.LookupBatches(matched.OrderByDescending(d => d.Id == selectedListing)
+                .ThenBy(d => d.Members.Where(m => m.Resolved).Select(m => DataFor(m, d.Duty)?.ProgressAt ?? DateTimeOffset.MinValue).DefaultIfEmpty().Min())))
                 if (StartLookup(detail, null, now)) break;
         PruneMemberData(now);
         CloseFinderIfIdle(now);
@@ -241,7 +241,7 @@ public sealed partial class Plugin
     }
     private bool StartLookup(PartyDetail detail, bool? provider, DateTimeOffset now)
     {
-        if ((!Active && !passivePreview) || Joining || LookupBusy) return false;
+        if ((!Running && !passivePreview) || Joining || LookupBusy) return false;
         var duty = englishDuties.GetValueOrDefault(detail.Duty) ?? "";
         var members = detail.Members.Where(m => m.Resolved).ToArray();
         bool Due(DateTimeOffset at, string? error) => now - at >= TimeSpan.FromMinutes(error is null ? 5 : 1);
@@ -249,13 +249,13 @@ public sealed partial class Plugin
         {
             var data = EnsureData(m, detail.Duty);
             return Due(data.ProgressAt, data.ProgressError ?? (data.Progress?.LookupFailed == true ? "Incomplete" : null));
-        }).ToArray() : [];
+        }).Take(8).ToArray() : [];
         var parseMembers = HasFFLogs && provider != true && now >= parsesRetry ? members.Where(m =>
         {
             if (m.Region.Length == 0) return false;
             var data = EnsureData(m, detail.Duty);
             return Due(data.ParsesAt, data.ParseError ?? (data.Parses?.Any(p => p.Failed || p.LatestZoneFailed) == true ? "Unavailable" : null));
-        }).ToArray() : [];
+        }).Take(8).ToArray() : [];
         if (progressMembers.Length == 0 && parseMembers.Length == 0) return false;
         var creds = credentials; var generation = inspectionGeneration;
         lookupCancellation?.Dispose(); lookupCancellation = new(); var ct = lookupCancellation.Token;

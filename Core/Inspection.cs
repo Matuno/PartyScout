@@ -67,6 +67,25 @@ internal sealed class CurrentPartyContext
 
 internal static class Inspection
 {
+    internal static IEnumerable<PartyDetail> LookupBatches(IEnumerable<PartyDetail> ordered) =>
+        ordered.GroupBy(detail => detail.Duty).Select(group => group.First() with
+        {
+            Members = group.SelectMany(detail => detail.Members).Where(member => member.Resolved)
+                .DistinctBy(member => MemberKey(member, group.Key)).ToArray(),
+        });
+
+    internal static PartyDetail? SingleMemberListing(Listing listing)
+    {
+        if (listing.Id == 0 || listing.Leader == 0 || listing.Parties != 1 || listing.Filled != 1 ||
+            listing.Host.Length == 0 || listing.HomeWorld == 0 || listing.Total is < 1 or > 48) return null;
+        var occupied = Enumerable.Range(0, listing.Total).Where(slot => listing.JobsPresent.ElementAtOrDefault(slot) != 0).Take(2).ToArray();
+        if (occupied.Length != 1) return null;
+        var slot = occupied[0];
+        return new PartyDetail(listing.Id, listing.IsDuty ? listing.Duty : 0, listing.Description,
+            [new PreviewMember(listing.Leader, listing.JobsPresent[slot], listing.Host) { Slot = slot, WorldId = listing.HomeWorld }])
+            { Recruitment = listing, Collected = listing.Seen };
+    }
+
     internal static PreviewMember[] SlottedMembers(int count, Func<int, PreviewMember?> read)
     {
         var members = new List<PreviewMember>();
@@ -86,6 +105,4 @@ internal static class Inspection
     internal static (ulong Id, string Name, string World, byte Job, uint Duty) MemberKey(PreviewMember member, uint duty) =>
         (member.Id, member.Id == 0 ? member.Name.ToUpperInvariant() : "", member.Id == 0 ? member.World.ToUpperInvariant() : "", member.Job, duty);
 
-    internal static bool SameParty(PartyDetail? a, PartyDetail b) => a is not null && a.Id == b.Id && a.Duty == b.Duty &&
-        a.Members.Select(m => (m.Id, m.Job, m.Slot)).SequenceEqual(b.Members.Select(m => (m.Id, m.Job, m.Slot)));
 }

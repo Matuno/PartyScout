@@ -10,8 +10,8 @@ namespace PartyScout;
 
 internal sealed partial class ScoutWindows(Plugin p)
 {
-    private enum RibbonTab { Matches, Current, People, Setup, Selected, Inbox }
-    internal bool MainOpen, SettingsOpen;
+    private enum RibbonTab { Matches, Current, Setup, Selected, Inbox }
+    internal bool MainOpen, SettingsOpen, ContactsOpen;
     internal bool EditingSetup { get; private set; }
     internal bool NativeFinderHovered { get; private set; }
     internal bool NativeFinderInteracting => NativeFinderHovered || DateTimeOffset.UtcNow - lastFinderHover < TimeSpan.FromSeconds(2);
@@ -22,7 +22,7 @@ internal sealed partial class ScoutWindows(Plugin p)
     private int selectedProfile;
     private string tomestoneKey = "", ffLogsId = "", ffLogsSecret = "";
     private bool resize = true, positioned;
-    private Vector2 lastPosition, lastSize;
+    private Vector2 lastPosition;
     private Vector2 dragDelta;
     private RibbonPalette palette = RibbonPalette.From(ColourScheme.Grey, 0);
     private Vector4 Accent => palette.Accent;
@@ -80,6 +80,7 @@ internal sealed partial class ScoutWindows(Plugin p)
         if (p.View.Open) Anchor();
         NativePartyOverlay();
         if (MainOpen) Main();
+        if (ContactsOpen) Contacts();
         if (SettingsOpen) Settings();
         if (!EditingSetup && p.Alert.Target is { } target && (C.Alerts || p.Automation)) Alert(target);
     }
@@ -111,17 +112,16 @@ internal sealed partial class ScoutWindows(Plugin p)
         var compact = Mode == RibbonMode.Collapsed;
         var size = (Mode switch { RibbonMode.Collapsed => new Vector2(392, 52), RibbonMode.Half => new Vector2(438, 340), _ => new Vector2(552, 480) }) * Scale;
         if (compact && p.Alert.Deadline is not null) size.Y += 24 * Scale;
-        if (resize || lastSize != size)
-        {
-            if (positioned)
-                ImGui.SetNextWindowPos(AnchorPlacement.KeepTopLeft(lastPosition, size, viewport.WorkPos, viewport.WorkSize));
-            ImGui.SetNextWindowSize(size);
-            resize = false;
-        }
+        ImGui.SetNextWindowSize(size, ImGuiCond.FirstUseEver);
+        var minHeight = compact ? size.Y : 180 * Scale;
+        ImGui.SetNextWindowSizeConstraints(new Vector2(392 * Scale, minHeight), new Vector2(float.MaxValue));
+        if (resize && positioned) ImGui.SetNextWindowPos(lastPosition);
         if (!positioned) ImGui.SetNextWindowPos(viewport.WorkPos + new Vector2(Math.Max(0, viewport.WorkSize.X - size.X - 24 * Scale), 24 * Scale), ImGuiCond.FirstUseEver);
-        if (ImGui.Begin("Party Scout###PartyScoutMain", ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize |
+        if (ImGui.Begin($"Party Scout###PartyScoutMain{Mode}", ImGuiWindowFlags.NoTitleBar |
             ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse))
         {
+            if (resize && positioned) ImGui.SetWindowPos(AnchorPlacement.KeepTopLeft(lastPosition, ImGui.GetWindowSize(), viewport.WorkPos, viewport.WorkSize));
+            resize = false;
             ImGui.SetWindowFontScale(C.Scale);
             var available = ImGui.GetContentRegionAvail();
             dragDelta = Vector2.Zero;
@@ -168,7 +168,6 @@ internal sealed partial class ScoutWindows(Plugin p)
                                 {
                                     case RibbonTab.Matches: Overview(); break;
                                     case RibbonTab.Current: YourParty(); break;
-                                    case RibbonTab.People: People(); break;
                                     case RibbonTab.Selected: Party(); break;
                                     case RibbonTab.Inbox: Inbox(); break;
                                 }
@@ -180,7 +179,7 @@ internal sealed partial class ScoutWindows(Plugin p)
                 }
             }
             if (dragDelta != Vector2.Zero) ImGui.SetWindowPos(ImGui.GetWindowPos() + dragDelta);
-            lastPosition = ImGui.GetWindowPos(); lastSize = ImGui.GetWindowSize(); positioned = true;
+            lastPosition = ImGui.GetWindowPos(); positioned = true;
         }
         ImGui.End();
         if (!MainOpen) p.Post(() => p.Stop("Closed. Monitoring stopped."));
@@ -199,7 +198,6 @@ internal sealed partial class ScoutWindows(Plugin p)
             {
                 (RibbonTab.Matches, "Matches"),
                 (RibbonTab.Current, "Your party"),
-                (RibbonTab.People, "People"),
                 (RibbonTab.Setup, "Setup"),
             };
             foreach (var (value, label) in tabs)
@@ -210,6 +208,8 @@ internal sealed partial class ScoutWindows(Plugin p)
                     .Push(ImGuiCol.Text, selected ? Accent : palette.Text);
                 if (ImGui.SmallButton(label + "##" + value)) SelectTab(value);
             }
+            ImGui.SameLine();
+            if (ImGui.SmallButton("People")) OpenContacts();
         }
         ImGui.Separator();
     }
@@ -226,6 +226,7 @@ internal sealed partial class ScoutWindows(Plugin p)
             if (notice is not null) { ImGui.TextWrapped(notice); ImGui.Separator(); }
             if (ImGui.MenuItem("Search profiles")) SelectTab(RibbonTab.Setup);
             if (ImGui.MenuItem("Your party")) SelectTab(RibbonTab.Current);
+            if (ImGui.MenuItem("Friends and contacts")) OpenContacts();
             if (ImGui.MenuItem("Close and stop")) MainOpen = false;
             ImGui.EndPopup();
         }
@@ -274,21 +275,24 @@ internal sealed partial class ScoutWindows(Plugin p)
     }
     private void Alert(Match target)
     {
-        ImGui.SetNextWindowSize(new Vector2(420, 0) * Scale, ImGuiCond.Appearing);
+        ImGui.SetNextWindowSize(new Vector2(420, 0) * Scale, ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowSizeConstraints(new Vector2(300, 100) * Scale, new Vector2(float.MaxValue));
         var open = true;
-        if (ImGui.Begin("Better party found###PartyScoutAlert", ref open, ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoFocusOnAppearing))
+        if (ImGui.Begin("Better party found###PartyScoutAlert", ref open, ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoFocusOnAppearing))
         {
             ImGui.SetWindowFontScale(C.Scale);
             ImGui.TextColored(Accent, p.DutyName(target.Listing));
-            ImGui.TextUnformatted($"{target.Score} points{(p.CurrentScore >= 0 ? $"  ·  your party {p.CurrentScore}" : "")}  ·  {target.Listing.Filled}/{target.Listing.Total}");
-            ImGui.PushTextWrapPos(ImGui.GetCursorPosX() + 380 * Scale); ImGui.TextWrapped(target.Listing.Description); ImGui.PopTextWrapPos();
+            ImGui.TextUnformatted($"{Plugin.MatchScoreLabel(target)}{(p.CurrentScore >= 0 ? $"  ·  your party {p.CurrentScore:0.#}" : "")}  ·  {target.Listing.Filled}/{target.Listing.Total}");
+            ImGui.TextWrapped(target.Listing.Description);
             ImGui.TextWrapped("Open for " + p.JobNames(target.PlayableJobs));
             ImGui.TextWrapped("Profiles: " + string.Join(" · ", target.ProfileNames));
+            PreferredJobsLine(target);
+            if (target.JobPreferences.Count > 0 && !target.JobPreferences.ContainsKey(p.View.CurrentJob)) ImGui.TextWrapped("Change to a preferred job to receive this fit bonus.");
             if (ImGui.SmallButton("Inspect party")) p.Post(() => p.Inspect(target.Listing));
             if (p.Alert.Deadline is { } end) ImGui.TextColored(Gold, $"Joining in {Math.Max(0, (int)Math.Ceiling((end - DateTimeOffset.UtcNow).TotalSeconds))}s");
             if (!target.PlayableJobs.Contains(p.View.CurrentJob)) ImGui.TextWrapped("Change to a compatible job before joining.");
             using (ImRaii.Disabled(p.Joining || !target.PlayableJobs.Contains(p.View.CurrentJob) || target.Listing.Parties != 1))
-                if (ImGui.Button(p.View.Party.InParty ? "Leave current & join" : "Join party")) p.Post(() => p.BeginJoin(target));
+                if (ImGui.Button((p.View.Party.InParty ? "Leave current & join" : "Join party") + (target.UsesJobPreferences ? " as " + p.JobNames([p.View.CurrentJob]) : ""))) p.Post(() => p.BeginJoin(target));
             ImGui.SameLine(); if (ImGui.Button("Dismiss")) p.Post(p.DismissAlert);
         }
         ImGui.End();
@@ -338,6 +342,24 @@ internal sealed partial class ScoutWindows(Plugin p)
             ImGui.TextWrapped("Preferences save automatically; credentials use Save. Monitoring and auto-join start paused after loading.");
         }
         ImGui.End();
+    }
+
+    internal void OpenContacts()
+    {
+        if (ContactsOpen) return;
+        ContactsOpen = true; p.Post(p.StartScan);
+    }
+
+    private void Contacts()
+    {
+        ImGui.SetNextWindowSize(new Vector2(460, 440) * Scale, ImGuiCond.FirstUseEver);
+        if (ImGui.Begin("Party Scout · Friends and contacts###PartyScoutContacts", ref ContactsOpen, ImGuiWindowFlags.NoCollapse))
+        {
+            ImGui.SetWindowFontScale(C.Scale);
+            People();
+        }
+        ImGui.End();
+        if (!ContactsOpen) p.Post(p.StopScan);
     }
 
     private void Credentials()

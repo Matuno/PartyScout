@@ -18,6 +18,7 @@ using Dalamud.Plugin.Services;
 using Lumina.Excel.Sheets;
 using PartyScout.Core;
 using Action = System.Action;
+using DutyCategory = PartyScout.Core.DutyCategory;
 using Role = PartyScout.Core.Role;
 
 namespace PartyScout;
@@ -41,7 +42,7 @@ public sealed partial class Plugin : IDalamudPlugin
     internal (ushort Id, string Name)[] WorldChoices { get; }
     private readonly ScoutWindows windows;
     private readonly ConcurrentQueue<Action> actions = new();
-    private readonly ConcurrentQueue<Listing> incoming = new();
+    private readonly ConcurrentQueue<(Listing Listing, int Segment)> incoming = new();
     private readonly Dictionary<ulong, Listing> listings = [], batch = [];
     private readonly ICallGateProvider<string> listTests;
     private readonly ICallGateProvider<string, string> runTests;
@@ -51,7 +52,7 @@ public sealed partial class Plugin : IDalamudPlugin
     private DateTimeOffset nextRefresh, collectingUntil, nextEvaluation, statusUntil;
     private uint territory;
     private bool collecting, disposed;
-    private volatile bool active, showNativeFinder;
+    private volatile bool active, contactActive, showNativeFinder;
     private int finderShowEvents, finderDrawEvents, finderVisibleDraws, finderOffThreadEvents;
     private int finderBlockedDraws, detailBlockedDraws, detailOffThreadEvents;
     private readonly bool quietListingError, quietPlateErrors;
@@ -60,6 +61,8 @@ public sealed partial class Plugin : IDalamudPlugin
 
     internal Configuration Settings { get; }
     internal bool Active { get => active; private set => active = value; }
+    internal bool ContactActive => contactActive;
+    private bool Running => Active || contactActive;
     internal bool ShowNativeFinder => showNativeFinder;
     internal bool Automation { get; private set; }
     internal AlertState Alert { get; } = new();
@@ -74,12 +77,16 @@ public sealed partial class Plugin : IDalamudPlugin
     internal string? FilterError => filter.Error;
     internal DateTimeOffset LastRefresh { get; private set; }
     internal string? ActionMessage => Joining || DateTimeOffset.UtcNow < statusUntil ? Status : null;
-    internal int? CurrentScore => View.Party.InParty ? Jobs.PartyScore(View.Party.Jobs, Settings) : -1;
+    internal bool UsesJobPreferences => filter.UsesJobPreferences;
+    internal string ScoreUnit => UsesJobPreferences ? "fit" : "pts";
+    internal double? CurrentScore => View.Party.InParty ? filter.CurrentRank(View.Party.Jobs, View.CurrentJob, partyContext.Duty) : -1;
+    internal static string MatchScoreLabel(Match match) => $"{match.Rank:0.#} {(match.UsesJobPreferences ? "fit" : "pts")}";
     internal bool Joining => joining is not null;
     internal bool QuietBackgroundAvailable => preview.QuietAudioAvailable && quietListingError && quietPlateErrors &&
         Volatile.Read(ref finderOffThreadEvents) == 0 && Volatile.Read(ref detailOffThreadEvents) == 0;
     internal (uint Id, string Name, Role Role)[] JobChoices { get; }
-    internal (uint Id, string Name, bool HighEnd)[] DutyChoices { get; }
+    internal DutyChoice[] DutyChoices { get; }
+    internal IGrouping<DutyCategory, DutyChoice>[] DutyGroups { get; }
 
     public Plugin(IDalamudPluginInterface pluginInterface, IFramework framework, IClientState clientState,
         ICondition condition, IPartyFinderGui partyFinder, ICommandManager commandManager, IPluginLog log,
@@ -122,13 +129,24 @@ public sealed partial class Plugin : IDalamudPlugin
             .Where(d => d.RowId > 0 && d.Name.ToString().Length > 0).ToDictionary(d => d.RowId, d => d.Name.ToString());
         JobChoices = Jobs.Rows.Select(id => data.GetExcelSheet<ClassJob>().GetRow(id))
             .Select(j => (j.RowId, j.Abbreviation.ToString(), Jobs.RoleOf((byte)j.RowId)!.Value)).ToArray();
+        var dutyCategories = data.GetExcelSheet<ContentUICategory>(ClientLanguage.English).ToDictionary(d => d.RowId, d => d.Name.ToString());
+        var expansions = data.GetExcelSheet<ExVersion>().ToDictionary(d => d.RowId, d => d.Name.ToString());
         DutyChoices = data.GetExcelSheet<ContentFinderCondition>().Where(d => d.RowId > 0 && d.Name.ToString().Length > 0)
-            .Select(d => (d.RowId, d.Name.ToString(), d.HighEndDuty)).OrderBy(d => d.Item2, StringComparer.CurrentCultureIgnoreCase).ToArray();
+            .Select(d =>
+            {
+                var expansion = DutyPicker.Expansion(d.ContentType.RowId, d.Content.RowId, d.RequiredExVersion.RowId);
+                var name = expansions.GetValueOrDefault(expansion);
+                return new DutyChoice(d.RowId, d.Name.ToString(), d.HighEndDuty,
+                    DutyPicker.Category(d.ContentType.RowId, dutyCategories.GetValueOrDefault(d.ContentUICategory.RowId) ?? "", d.HighEndDuty),
+                    string.IsNullOrWhiteSpace(name) ? uint.MaxValue : expansion, string.IsNullOrWhiteSpace(name) ? "Other" : name);
+            }).OrderBy(d => d.Category).ThenBy(d => d.ExpansionId == uint.MaxValue).ThenByDescending(d => d.ExpansionId)
+            .ThenBy(d => d.Name, StringComparer.CurrentCultureIgnoreCase).ToArray();
+        DutyGroups = DutyChoices.GroupBy(d => d.Category).ToArray();
         listTests = pi.GetIpcProvider<string>("DalamudWorkspace.ListTests.v1.PartyScout");
         runTests = pi.GetIpcProvider<string, string>("DalamudWorkspace.RunTests.v1.PartyScout");
         listTests.RegisterFunc(() => JsonSerializer.Serialize(new[] { new { name = "smoke", readOnly = true, description = "Checks monitor state, native adapter and loaded assembly." } }));
         runTests.RegisterFunc(Smoke);
-        commands.AddHandler("/partyscout", new CommandInfo(Command) { HelpMessage = "Open Party Scout. /partyscout stop cancels monitoring; /partyscout settings opens appearance and notifications." });
+        commands.AddHandler("/partyscout", new CommandInfo(Command) { HelpMessage = "Open Party Scout. /partyscout people opens contacts, stop cancels monitoring, settings opens preferences." });
         foreach (var eventType in new[] { AddonEvent.PreShow, AddonEvent.PostShow, AddonEvent.PostSetup, AddonEvent.PreDraw })
         {
             addonLifecycle.RegisterListener(eventType, "LookingForGroup", OnFinderLifecycle);
@@ -143,7 +161,8 @@ public sealed partial class Plugin : IDalamudPlugin
     internal void Post(Action action) { if (!disposed) actions.Enqueue(action); }
     private void Command(string command, string args) => Post(() =>
     {
-        if (args.Trim().Equals("stop", StringComparison.OrdinalIgnoreCase)) Stop("Stopped.");
+        if (args.Trim().Equals("stop", StringComparison.OrdinalIgnoreCase)) { contactActive = false; windows.ContactsOpen = false; Stop("Stopped."); }
+        else if (args.Trim().Equals("people", StringComparison.OrdinalIgnoreCase)) windows.OpenContacts();
         else if (args.Trim().Equals("settings", StringComparison.OrdinalIgnoreCase)) windows.SettingsOpen = true;
         else Open();
     });
@@ -154,44 +173,30 @@ public sealed partial class Plugin : IDalamudPlugin
         windows.MainOpen = true;
         if (Active) return;
         if (!SafeToMonitor()) { ActionStatus("Available when logged in, outside duties and combat."); return; }
+        var wasRunning = Running;
+        Active = true; Automation = false;
+        if (!wasRunning) StartEngine();
+        nextRefresh = DateTimeOffset.MinValue;
+    }
+    private void StartEngine()
+    {
         passivePreview = false;
-        Active = true; Automation = false; territory = client.TerritoryType;
+        territory = client.TerritoryType;
         Alert.Reset(); Inbox.Clear(); listings.Clear(); batch.Clear(); Matches = []; OverviewMatches = []; OverviewListings = []; collecting = false;
         while (incoming.TryDequeue(out _)) { }
         nextRefresh = DateTimeOffset.MinValue;
-        preview.Start(); native.SetHidden(FinderVisibility.HideFinder(Active, showNativeFinder));
+        preview.Start(); native.SetHidden(FinderVisibility.HideFinder(Running, showNativeFinder));
         Status = "Connecting to Party Finder…";
         pf.ReceiveListing += Receive;
-        if (Settings.WatchContacts) { preview.Quiet(() => { native.RefreshSocial(); return true; }); nextSocialRead = default; }
-        if (WantsSweep) StartSweep();
-    }
-    internal void Stop(string reason, bool closeNative = false)
-    {
-        var wasActive = Active;
-        FinishJoin(true);
-        Active = Automation = false; collecting = false;
-        pf.ReceiveListing -= Receive; Alert.Reset(); Inbox.Clear(); DismissToast();
-        preview.Quiet(() =>
-        {
-            native.FinishFinderShow(); native.SetHidden(false); native.SetManualDetailHidden(false);
-            if (closeNative && wasActive) native.Close();
-            else if (ownsFinder && !windows.NativeFinderInteracting && !preview.DetailOpen) native.CloseFinder();
-            preview.Stop(); return true;
-        });
-        ownsFinder = openingFinder = profileRefreshPending = passivePreview = false;
-        CancelLookups(true); ClearCompanyRoster(); Scanning = socialSweepRequested = BrowseAll = inspectionSweep = false; socialListings.Clear(); ResetSocialHits(); scanPageListings.Clear(); scanAttemptedDetails.Clear(); socialCollectionQueue.Clear(); scannedPages.Clear();
-        Status = reason;
-        listings.Clear(); batch.Clear(); Matches = []; OverviewMatches = []; OverviewListings = []; CurrentListing = null;
-        while (incoming.TryDequeue(out _)) { }
     }
     internal void ToggleMonitoring() { if (Active) Stop("Monitoring paused."); else Open(); }
     internal void ToggleNativeFinder()
     {
         showNativeFinder = !showNativeFinder; Settings.ShowNativeFinder = showNativeFinder;
-        if (Active)
+        if (Running)
         {
             if (showNativeFinder) native.FinishFinderShow();
-            native.SetHidden(FinderVisibility.HideFinder(Active, showNativeFinder));
+            native.SetHidden(FinderVisibility.HideFinder(Running, showNativeFinder));
             if (showNativeFinder)
             {
                 native.SetManualDetailHidden(false);
@@ -209,7 +214,9 @@ public sealed partial class Plugin : IDalamudPlugin
     }
     internal void Changed()
     {
+        var preferred = filter.UsesJobPreferences;
         Settings.Normalize(); filter = new ListingFilter(Settings, dutySizes);
+        if (preferred != filter.UsesJobPreferences) Alert.Reset();
         if (Joining) CancelJoin("Party switch cancelled. Check your party.");
         DismissToast();
         if (!Settings.TimedJoin) Automation = false;
@@ -246,16 +253,16 @@ public sealed partial class Plugin : IDalamudPlugin
         var now = DateTimeOffset.UtcNow;
         var slots = l.Slots.Select(s => s.Accepting.Aggregate(0UL, (mask, flag) => mask | (ulong)flag)).ToArray();
         var search = (uint)l.SearchArea;
-        incoming.Enqueue(new Listing(l.Id, l.ContentId, l.RawDuty, l.DutyType == DutyType.Normal,
+        incoming.Enqueue((new Listing(l.Id, l.ContentId, l.RawDuty, l.DutyType == DutyType.Normal,
             l.Description.TextValue, l.SlotsAvailable, l.SlotsFilled, l.RawJobsPresent.ToArray(), slots,
             (search & (1 << 5)) != 0, (search & (1 << 1)) != 0, l.Parties, l.MinimumItemLevel,
             now, now.AddSeconds(l.SecondsRemaining))
             { Host = l.Name.TextValue, HomeWorld = (ushort)l.HomeWorld.RowId, Objective = (byte)l.Objective, Conditions = (byte)l.Conditions,
-                DutySettings = (byte)l.DutyFinderSettings, Loot = (byte)l.LootRules, Beginners = l.BeginnersWelcome });
+                DutySettings = (byte)l.DutyFinderSettings, Loot = (byte)l.LootRules, Beginners = l.BeginnersWelcome }, args.BatchNumber));
     }
     private void OnLogMessage(ILogMessage message)
     {
-        if ((!Active && !passivePreview) || !framework.IsInFrameworkUpdateThread) return;
+        if ((!Running && !passivePreview) || !framework.IsInFrameworkUpdateThread) return;
         if (message.LogMessageId != 974 && message.LogMessageId is not (>= 5855 and <= 5860)) return;
         var manual = message.LogMessageId == 974
             ? windows.NativeFinderInteracting || native.AdventurerPlateOpen()
@@ -266,8 +273,8 @@ public sealed partial class Plugin : IDalamudPlugin
     }
     private void OnFinderLifecycle(AddonEvent type, AddonArgs args)
     {
-        if (!Active) return;
-        var hide = FinderVisibility.HideFinder(Active, showNativeFinder);
+        if (!Running) return;
+        var hide = FinderVisibility.HideFinder(Running, showNativeFinder);
         var quietOpen = openingFinder;
         if (type == AddonEvent.PreShow && !quietOpen && framework.IsInFrameworkUpdateThread) ownsFinder = false;
         if (!hide && !quietOpen) return;
@@ -284,8 +291,8 @@ public sealed partial class Plugin : IDalamudPlugin
     }
     private void OnJoinLifecycle(AddonEvent type, AddonArgs args)
     {
-        if (!Active) return;
-        var hidingDetail = args.AddonName == "LookingForGroupDetail" && FinderVisibility.HideDetail(Active, showNativeFinder, preview.SuppressDetail, Joining);
+        if (!Running) return;
+        var hidingDetail = args.AddonName == "LookingForGroupDetail" && FinderVisibility.HideDetail(Running, showNativeFinder, preview.SuppressDetail, Joining);
         if (hidingDetail)
         {
             if (type == AddonEvent.PreDraw) { args.PreventOriginal(); Interlocked.Increment(ref detailBlockedDraws); }
@@ -325,15 +332,16 @@ public sealed partial class Plugin : IDalamudPlugin
                 ObserveCurrentParty(previousParty, now);
                 if (Active && !Joining && (previousParty.InParty != View.Party.InParty || previousParty.Leader != View.Party.Leader || previousParty.PartyId != View.Party.PartyId))
                 { Alert.Reset(); Automation = false; DismissToast(); }
-                if (Active && (!SafeToMonitor() || territory != client.TerritoryType)) Stop("Stopped for duty or client-state change.", true);
+                if (Running && (!SafeToMonitor() || territory != client.TerritoryType)) Stop("Stopped for duty or client-state change.", true);
                 while (actions.TryDequeue(out var action)) action();
-                if (!Active) { CollectManualWhenIdle(now); return; }
-                native.SetHidden(FinderVisibility.HideFinder(Active, showNativeFinder));
+                if (!Running) { CollectManualWhenIdle(now); return; }
+                native.SetHidden(FinderVisibility.HideFinder(Running, showNativeFinder));
                 if (showNativeFinder) native.SetManualDetailHidden(false);
                 else if (!Joining && preview.DetailOpen) native.SetManualDetailHidden(true);
                 var received = false;
-                while (incoming.TryDequeue(out var listing))
+                while (incoming.TryDequeue(out var message))
                 {
+                    var listing = message.Listing;
                     received = true;
                     if (socialSweepRequested)
                     {
@@ -341,40 +349,23 @@ public sealed partial class Plugin : IDalamudPlugin
                             socialListings.Remove(socialListings.MinBy(kv => kv.Value.Seen).Key);
                         socialListings[listing.Id] = listing;
                     }
-                    if (collecting) batch[listing.Id] = listing;
+                    if (collecting) { batch[listing.Id] = listing; batchEnded |= message.Segment == 0; }
                     else RememberListing(listing);
                 }
-                if (collecting && now >= collectingUntil)
-                {
-                    var pageIds = Scanning && scanPageNeedsSnapshot ? native.PageListingIds() : null;
-                    if (pageIds is not null && now < pageUntil && native.Page() is { } waitingPage &&
-                        batch.Keys.Count(pageIds.Contains) < waitingPage.ExpectedListings)
-                    { collectingUntil = now.AddSeconds(1); }
-                    else
-                    {
-                        lastBatchCount = pageIds is null ? batch.Count : batch.Keys.Count(pageIds.Contains);
-                        foreach (var l in batch.Values)
-                        {
-                            RememberListing(l);
-                            if (Scanning && scanPageNeedsSnapshot && pageIds!.Contains(l.Id))
-                                scanPageListings[l.Id] = l;
-                        }
-                        batch.Clear(); collecting = false; LastRefresh = now;
-                        if (Settings.Debug) log.Debug("Party Scout refreshed: {Count} listings.", listings.Count);
-                    }
-                }
-                if (!CanStartSweep(now)) TickProfileRefresh(now);
+                if (collecting && FinishListingBatch(now) && Settings.Debug)
+                    log.Debug("Party Scout refreshed: {Count} listings.", listings.Count);
+                if (Active && !CanStartSweep(now)) TickProfileRefresh(now);
                 if (received || now >= nextEvaluation) { RebuildMatches(now); nextEvaluation = now.AddSeconds(1); }
                 if (!Joining) { Collect(now); TickScan(now); }
                 if (CanStartSweep(now)) StartSweep();
                 if (windows.EditingSetup) { if (Joining) CancelJoin("Party switch cancelled. Check your party."); Alert.SuppressExisting(Matches); DismissToast(); }
                 else if (Joining) TickJoin(now);
-                else UpdateAlert(now);
-                native.SetHidden(FinderVisibility.HideFinder(Active, showNativeFinder));
+                else if (Active) UpdateAlert(now);
+                native.SetHidden(FinderVisibility.HideFinder(Running, showNativeFinder));
             }
             catch (Exception ex)
             {
-                Stop("Stopped after an error. See /xllog for Party Scout details."); ActionStatus(Status); log.Error(ex, "Party Scout monitor stopped.");
+                Stop("Stopped after an error. See /xllog for Party Scout details.", true); ActionStatus(Status); log.Error(ex, "Party Scout monitor stopped.");
             }
         }
     }
@@ -383,15 +374,17 @@ public sealed partial class Plugin : IDalamudPlugin
         foreach (var id in listings.Where(kv => !SweepPolicy.ShowContact(kv.Value, now)).Select(kv => kv.Key).ToArray()) listings.Remove(id);
         CurrentListing = View.Party.InParty && View.Party.Leader != 0 ? listings.Values.FirstOrDefault(l => l.Fresh(now) && l.Leader == View.Party.Leader) : null;
         Match[] Ordered(IEnumerable<Match> matches) => matches
-            .OrderByDescending(m => m.Score).ThenByDescending(m => m.Listing.Filled).ThenBy(m => m.Listing.Id).ToArray();
-        Matches = Ordered(listings.Values.Select(l => filter.Evaluate(l, now)).OfType<Match>());
-        OverviewMatches = WantsSweep
+            .OrderByDescending(m => m.Rank).ThenByDescending(m => m.Score).ThenByDescending(m => m.Listing.Filled).ThenBy(m => m.Listing.Id).ToArray();
+        Matches = Active ? Ordered(listings.Values.Select(l => filter.Evaluate(l, now)).OfType<Match>()) : [];
+        OverviewMatches = Active && WantsSweep
             ? Ordered(listings.Values.Select(l => filter.Evaluate(l, l.Seen)).OfType<Match>()) : Matches;
         OverviewListings = listings.Values.Where(filter.InEnabledDuties)
-            .OrderByDescending(l => Jobs.Score(l.JobsPresent.Take(l.Total), Settings)).ThenByDescending(l => l.Filled).ThenBy(l => l.Id).ToArray();
+            .OrderByDescending(l => UsesJobPreferences ? l.Filled : Jobs.Score(l.JobsPresent.Take(l.Total), Settings))
+            .ThenByDescending(l => Jobs.Score(l.JobsPresent.Take(l.Total), Settings)).ThenByDescending(l => l.Filled).ThenBy(l => l.Id).ToArray();
     }
     private void RememberListing(Listing listing)
     {
+        preview.ObserveListing(listing);
         if (listings.Count >= 1000 && !listings.ContainsKey(listing.Id))
             listings.Remove(listings.MinBy(kv => kv.Value.Seen).Key);
         listings[listing.Id] = listing;
@@ -406,7 +399,7 @@ public sealed partial class Plugin : IDalamudPlugin
             if (Alert.Target is { } found) Inbox.Add(found, now);
             DismissToast();
             if (Settings.Alerts && Settings.Toast && Alert.Target is { } target)
-                toast = notifications.AddNotification(new Notification { Title = "Party Scout · Better match", Content = $"{DutyName(target.Listing)} · {target.Score} points\n{target.Listing.Description}", Type = NotificationType.Info, InitialDuration = TimeSpan.FromSeconds(8) });
+                toast = notifications.AddNotification(new Notification { Title = "Party Scout · Better match", Content = $"{DutyName(target.Listing)} · {MatchScoreLabel(target)}\n{target.Listing.Description}", Type = NotificationType.Info, InitialDuration = TimeSpan.FromSeconds(8) });
             if (Settings.Alerts && Settings.Sound) NativePartyFinder.PlaySound(Settings.SoundId);
         }
         if (Alert.Target is null) DismissToast();
@@ -417,7 +410,7 @@ public sealed partial class Plugin : IDalamudPlugin
 
     public void Dispose()
     {
-        lock (sync) { disposed = true; Active = Automation = false; while (actions.TryDequeue(out _)) { } }
+        lock (sync) { disposed = true; Active = Automation = contactActive = false; while (actions.TryDequeue(out _)) { } }
         framework.Update -= Update; pf.ReceiveListing -= Receive; chat.LogMessage -= OnLogMessage; addonLifecycle.UnregisterListener(OnFinderLifecycle); addonLifecycle.UnregisterListener(OnJoinLifecycle);
         pi.UiBuilder.Draw -= Draw; pi.UiBuilder.OpenMainUi -= OpenMain; pi.UiBuilder.OpenConfigUi -= OpenSettings;
         commands.RemoveHandler("/partyscout"); runTests.UnregisterFunc(); listTests.UnregisterFunc(); DismissToast();
@@ -429,7 +422,7 @@ public sealed partial class Plugin : IDalamudPlugin
             {
                 native.FinishFinderShow(); native.SetHidden(false); native.SetManualDetailHidden(false);
                 if (ownsFinder && !windows.NativeFinderInteracting && !preview.DetailOpen) native.CloseFinder();
-                preview.Dispose(); return true;
+                preview.Dispose(); native.RestoreHiddenInputs(); return true;
             });
             ownsFinder = openingFinder = profileRefreshPending = false;
         }
@@ -452,7 +445,7 @@ public sealed partial class Plugin : IDalamudPlugin
             lock (sync)
             {
                 var page = native.Page();
-                return JsonSerializer.Serialize(new { ok = !disposed && (!Automation || Active) && (!Joining || Active) && (!Scanning || Active) && (!preview.Busy || Active && !Joining),
+                return JsonSerializer.Serialize(new { ok = !disposed && (!Automation || Active) && (!Joining || Active) && (!Scanning || Running) && (!preview.Busy || (Running || passivePreview) && !Joining),
                 test = "smoke", assemblySha256 = assemblyHash, frameworkThread = framework.IsInFrameworkUpdateThread,
                 active = Active, automation = Automation, joining = Joining, nativeOpen = native.Capture().Open,
                 hiddenByPlugin = native.Hidden, showNativeFinder, manualDetailHiddenByPlugin = native.ManualDetailHidden, ownsFinder, profileRefreshPending, matches = Matches.Length, displayedMatches = OverviewMatches.Length, cachedListings = listings.Count,
@@ -466,6 +459,8 @@ public sealed partial class Plugin : IDalamudPlugin
                 previewOpen = preview.DetailOpen, previewMembers = Inspected?.Members.Length ?? 0,
                 resolvedMembers = Inspected?.Members.Count(m => m.Resolved) ?? 0, lookupBusy = LookupBusy,
                 collectedParties = preview.Parties.Count, currentMembers = CurrentParty?.Members.Length ?? 0,
+                summaryRosters = preview.SummaryRosters, detailRequests = preview.DetailRequests, plateRequests = preview.PlateRequests,
+                earlyListingBatches = EarlyListingBatches, lastListingBatchMs = LastListingBatchMs,
                 scanning = Scanning, scanStatus = ScanStatus, scannedPages = scannedPages.Count,
                 scanStage, scanPage = page, scanPageListings = scanPageListings.Count, lastBatchCount,
                 scanPageNeedsSnapshot,
@@ -473,7 +468,7 @@ public sealed partial class Plugin : IDalamudPlugin
                 nativeFinderHovered = windows.NativeFinderHovered, nativeFinderInteracting = windows.NativeFinderInteracting, initialRefreshAttempts = InitialRefreshAttempts,
                 lastInitialRefreshAccepted = LastInitialRefreshAccepted,
                 scannedListings = socialListings.Count, scannedRosters = ScannedRosters,
-                contactWatch = Settings.WatchContacts, companyMembers = companyRoster.Count, companyBusy = CompanyBusy, companyStatus, completedSweeps, lastSweepPages,
+                contactWatch = ContactActive, companyMembers = companyRoster.Count, companyBusy = CompanyBusy, companyStatus, completedSweeps, lastSweepPages,
                 quietAudioAvailable = preview.QuietAudioAvailable, quietListingError, quietPlateErrors,
                 suppressedListingErrors = preview.SuppressedListingErrors, suppressedPlateErrors = preview.SuppressedPlateErrors,
                 suppressedSounds = preview.SuppressedSounds, passedThroughSounds = preview.PassedThroughSounds,

@@ -11,6 +11,7 @@ public sealed partial class Plugin
     private long sourcePartyId;
     private ulong sourceLeader;
     private int sourceMembers;
+    private double? sourceRank;
     private DateTimeOffset nextJoinAllowed, joinUntil, nextStep;
 
     internal void BeginJoin(Match requested, bool automatic = false)
@@ -20,7 +21,7 @@ public sealed partial class Plugin
         if (!Active || Joining || !SafeToJoin() || native.HasOtherDialog || now < nextJoinAllowed ||
             match is null || !match.Listing.Fresh(now) || !match.PlayableJobs.Contains(View.CurrentJob) ||
             match.Listing.Leader == View.Party.Leader || match.Listing.Parties != 1 ||
-            automatic && (!Automation || CurrentScore is not { } baseline || match.Score <= baseline))
+            automatic && (!Automation || CurrentScore is not { } baseline || match.RankForJob(View.CurrentJob) <= baseline))
         {
             ActionStatus("Join unavailable: use a compatible current job, leave queues/dialogs, or wait for a fresh normal-party listing.");
             if (automatic) { Alert.Dismiss(); Automation = false; }
@@ -30,6 +31,7 @@ public sealed partial class Plugin
         preview.Quiet(() => { preview.Pause(true); return true; }); CancelLookups();
         joining = match; confirmedJoinListing = null; joinAutomatic = automatic; joinStep = 0; confirmed = joinDetailRequested = false;
         sourcePartyId = View.Party.PartyId; sourceLeader = View.Party.Leader; sourceMembers = View.Party.Jobs.Length;
+        sourceRank = CurrentScore;
         nextJoinAllowed = now.AddSeconds(30); joinUntil = now.AddSeconds(20); nextStep = now;
         Inbox.Remove(match.Listing.Id); Alert.Dismiss(); DismissToast(); Status = "Checking target party…";
     }
@@ -60,7 +62,7 @@ public sealed partial class Plugin
             var checkedMatch = filter.Evaluate(detail, now);
             if (detail.Leader != target.Listing.Leader || detail.Duty != target.Listing.Duty || detail.Parties != 1 ||
                 checkedMatch is null || !checkedMatch.PlayableJobs.Contains(View.CurrentJob) ||
-                joinAutomatic && View.Party.InParty && (CurrentScore is not { } baseline || checkedMatch.Score <= baseline))
+                joinAutomatic && ((View.Party.InParty ? CurrentScore : sourceRank) is not { } baseline || checkedMatch.RankForJob(View.CurrentJob) <= baseline))
             { CancelJoin("The target changed or no longer matches. No further action taken."); return; }
             confirmedJoinListing = detail;
             if (joinStep == 1 && View.Party.InParty)

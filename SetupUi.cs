@@ -42,44 +42,17 @@ internal sealed partial class ScoutWindows
             var profile = C.Profiles[selectedProfile];
             ImGui.SetNextItemWidth(-1);
             if (ImGui.InputTextWithHint("##ProfileName", "Profile name", ref profile.Name, 80)) p.Post(p.Save);
-            if (ImGui.CollapsingHeader("Jobs", ImGuiTreeNodeFlags.DefaultOpen))
-            {
-                var right = ImGui.GetCursorScreenPos().X + ImGui.GetContentRegionAvail().X;
-                foreach (var role in Enum.GetValues<Role>())
-                {
-                    ImGui.TextDisabled(role switch { Role.Ranged => "Ranged", Role.Caster => "Caster", _ => role.ToString() });
-                    ImGui.SameLine(60 * Scale);
-                    var first = true;
-                    foreach (var job in p.JobChoices.Where(j => j.Role == role && (j.Id >= 19 || profile.Jobs.Contains(j.Id))))
-                    {
-                        if (!first)
-                        {
-                            if (ImGui.GetItemRectMax().X + 44 * Scale <= right) ImGui.SameLine();
-                            else ImGui.SetCursorPosX(60 * Scale);
-                        }
-                        first = false;
-                        var selected = profile.Jobs.Contains(job.Id);
-                        using var colour = ImRaii.PushColor(ImGuiCol.Button, selected ? palette.Active : palette.Control)
-                            .Push(ImGuiCol.Text, selected ? Accent : palette.Text);
-                        if (ImGui.SmallButton(job.Name + "##job" + job.Id))
-                        { if (selected) profile.Jobs.Remove(job.Id); else profile.Jobs.Add(job.Id); p.Post(p.Changed); }
-                    }
-                }
-                if (profile.Jobs.Count == 0) ImGui.TextColored(Gold, "Choose at least one job.");
-            }
+            if (ImGui.CollapsingHeader("Jobs", ImGuiTreeNodeFlags.DefaultOpen)) JobPicker(profile);
             ImGui.SetNextItemWidth(-1);
             ImGui.SetNextWindowSizeConstraints(new Vector2(360, 0) * Scale, new Vector2(520, 300) * Scale);
             var dutyLabel = profile.Duties.Count == 0 ? "All duties" : profile.Duties.Count == 1 ? p.DutyLabel(profile.Duties.First()) : $"{profile.Duties.Count} duties";
             if (ImGui.BeginCombo("##Duties", dutyLabel))
             {
                 ImGui.SetNextItemWidth(-1); ImGui.InputTextWithHint("##DutySearch", "Search duties…", ref dutySearch, 150);
-                if (profile.Duties.Count > 0 && ImGui.SmallButton("Clear selection")) { profile.Duties.Clear(); p.Post(p.Changed); }
-                if (ImGui.BeginTabBar("DutyCategories"))
-                {
-                    if (ImGui.BeginTabItem("High-end")) { DutyChoices(profile, true); ImGui.EndTabItem(); }
-                    if (ImGui.BeginTabItem("Other")) { DutyChoices(profile, false); ImGui.EndTabItem(); }
-                    ImGui.EndTabBar();
-                }
+                using (ImRaii.Disabled(profile.Duties.Count == 0))
+                    if (ImGui.SmallButton("Clear selection")) { profile.Duties.Clear(); p.Post(p.Changed); }
+                DutyPickerContents(dutySearch, profile.Duties, true, id =>
+                { if (!profile.Duties.Add(id)) profile.Duties.Remove(id); p.Post(p.Changed); });
                 ImGui.EndCombo();
             }
             if (ImGui.Checkbox("Require full duty size", ref profile.RequireFullDutySize)) p.Post(p.Changed);
@@ -96,7 +69,7 @@ internal sealed partial class ScoutWindows
             }
             if (ImGui.CollapsingHeader("Weights & response · all profiles"))
             {
-                ImGui.TextWrapped("Points per filled member. Parses never affect ranking.");
+                ImGui.TextWrapped(p.UsesJobPreferences ? "Fill and job preference rank first; role points break ties. Parses never affect ranking." : "Points per filled member. Parses never affect ranking.");
                 foreach (var role in Enum.GetValues<Role>())
                 {
                     ImGui.SetNextItemWidth(110 * Scale);
@@ -117,16 +90,109 @@ internal sealed partial class ScoutWindows
         }
         ImGui.EndChild();
     }
-    private static string RoleName(Role role) => role switch { Role.Ranged => "Physical ranged", Role.Caster => "Magical ranged", _ => role.ToString() };
-    private void DutyChoices(SearchProfile profile, bool highEnd)
+    private void JobPicker(SearchProfile profile)
     {
-        if (ImGui.BeginChild("DutyChoices", new Vector2(0, 160 * Scale), false))
-            foreach (var duty in p.DutyChoices.Where(d => d.HighEnd == highEnd && d.Name.Contains(dutySearch, StringComparison.CurrentCultureIgnoreCase)))
+        var labelWidth = Math.Max(40 * Scale, ImGui.CalcTextSize("WHM").X + 2 * ImGui.GetStyle().FramePadding.X);
+        if (ImGui.BeginTable("ProfileJobs", 2, ImGuiTableFlags.SizingStretchProp))
+        {
+            ImGui.TableSetupColumn("Role", ImGuiTableColumnFlags.WidthFixed, Math.Max(76 * Scale, ImGui.CalcTextSize("Ranged").X + 24 * Scale));
+            ImGui.TableSetupColumn("Jobs", ImGuiTableColumnFlags.WidthStretch);
+            foreach (var role in Enum.GetValues<Role>())
             {
-                var selected = profile.Duties.Contains(duty.Id);
-                if (ImGui.Checkbox(duty.Name + "##duty" + duty.Id, ref selected))
-                { if (selected) profile.Duties.Add(duty.Id); else profile.Duties.Remove(duty.Id); p.Post(p.Changed); }
+                var choices = p.JobChoices.Where(job => job.Role == role && Jobs.InProfilePicker(job.Id, profile.Jobs.Contains(job.Id))).ToArray();
+                var enabled = choices.Where(job => profile.Jobs.Contains(job.Id)).ToArray();
+                ImGui.PushID((int)role); ImGui.TableNextRow(); ImGui.TableNextColumn();
+                ImGui.AlignTextToFramePadding();
+                ImGui.TextDisabled(role switch { Role.Ranged => "Ranged", Role.Caster => "Caster", _ => role.ToString() });
+                ImGui.SameLine(0, 2 * Scale);
+                using (ImRaii.Disabled(enabled.Length == 0))
+                using (ImRaii.PushColor(ImGuiCol.Text, enabled.Length > 0 && enabled.All(job => profile.PreferredJobs.Contains(job.Id)) ? Gold : Muted))
+                    if (Icon(FontAwesomeIcon.Star, "preferRole", "Toggle preference for selected jobs in this role", new Vector2(20 * Scale, ImGui.GetFrameHeight())))
+                    { profile.ToggleRolePreference(role); p.Post(p.Changed); }
+                ImGui.TableNextColumn();
+                var starWidth = ImGui.GetFrameHeight();
+                var jobWidth = labelWidth + starWidth + 2 * Scale;
+                var columns = Math.Clamp((int)((ImGui.GetContentRegionAvail().X + 6 * Scale) / (jobWidth + 6 * Scale)), 1, 4);
+                for (var i = 0; i < choices.Length; i++)
+                {
+                    var job = choices[i];
+                    if (i % columns != 0) ImGui.SameLine(0, 6 * Scale);
+                    ImGui.PushID((int)job.Id); ImGui.BeginGroup();
+                    using (ImRaii.PushColor(ImGuiCol.Button, profile.Jobs.Contains(job.Id) ? palette.Active : palette.Control)
+                        .Push(ImGuiCol.Text, profile.Jobs.Contains(job.Id) ? palette.Text : Muted))
+                        if (ImGui.Button(job.Name + "##play", new Vector2(labelWidth, ImGui.GetFrameHeight())))
+                        { profile.ToggleJob(job.Id); p.Post(p.Changed); }
+                    if (ImGui.IsItemHovered()) ImGui.SetTooltip(profile.Jobs.Contains(job.Id) ? "Remove " + job.Name : "I can play " + job.Name);
+                    ImGui.SameLine(0, 2 * Scale);
+                    using (ImRaii.PushColor(ImGuiCol.Text, profile.PreferredJobs.Contains(job.Id) ? Gold : Muted))
+                        if (Icon(FontAwesomeIcon.Star, "preferJob", profile.PreferredJobs.Contains(job.Id) ? "Preferred · click to accept without preference" : "Prefer " + job.Name, new Vector2(starWidth)))
+                        { profile.TogglePreference(job.Id); p.Post(p.Changed); }
+                    ImGui.EndGroup(); ImGui.PopID();
+                }
+                ImGui.PopID();
             }
+            ImGui.EndTable();
+        }
+        ImGui.TextColored(Gold, "Starred = preferred");
+        if (profile.Jobs.Count == 0) ImGui.TextColored(Gold, "Choose at least one job.");
+        ImGui.TextDisabled("Favour preferred jobs"); ImGui.SetNextItemWidth(-1);
+        if (ImGui.Combo("##PreferenceFill", ref profile.PreferredFillAllowance, "At equal fill\0Allow 1 fewer member\0Allow 2 fewer members\0")) p.Post(p.Changed);
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Preferred jobs can outweigh this many fewer filled slots. Multiple preferred vacancies count once. Without stars on any enabled profile, ranking uses role points.");
+    }
+    private static string RoleName(Role role) => role switch { Role.Ranged => "Physical ranged", Role.Caster => "Magical ranged", _ => role.ToString() };
+    private void DutyPickerContents(string search, IReadOnlySet<uint> selected, bool multiple, Action<uint> choose)
+    {
+        void Row(uint id, string name)
+        {
+            var isSelected = selected.Contains(id);
+            if (multiple ? ImGui.Checkbox(name + "##duty" + id, ref isSelected) : ImGui.Selectable(name + "##duty" + id, isSelected))
+                choose(id);
+        }
+
+        ImGui.TextDisabled("SELECTED");
+        if (ImGui.BeginChild("SelectedDuties", new Vector2(0, 2 * ImGui.GetFrameHeightWithSpacing()), false))
+        {
+            if (selected.Count == 0) ImGui.TextDisabled(multiple ? "All duties" : "No duty selected");
+            else
+            {
+                ImGui.PushID("selected");
+                foreach (var id in selected.OrderBy(p.DutyLabel, StringComparer.CurrentCultureIgnoreCase).ToArray()) Row(id, p.DutyLabel(id));
+                ImGui.PopID();
+            }
+        }
+        ImGui.EndChild(); ImGui.Separator();
+
+        if (ImGui.BeginChild("DutyChoices", new Vector2(0, 140 * Scale), false))
+        {
+            var query = search.Trim();
+            var searching = query.Length > 0;
+            var found = false;
+            foreach (var group in p.DutyGroups)
+            {
+                if (!group.Any(duty => DutyPicker.Matches(duty, query))) continue;
+                found = true; ImGui.PushID((int)group.Key);
+                var label = DutyPicker.Label(group.Key);
+                var open = true;
+                if (searching) ImGui.TextColored(Accent, label);
+                else open = ImGui.CollapsingHeader(label);
+                if (open)
+                    foreach (var expansion in group.Where(duty => DutyPicker.Matches(duty, query)).GroupBy(duty => (duty.ExpansionId, duty.Expansion)))
+                    {
+                        ImGui.PushID(expansion.Key.ExpansionId.ToString());
+                        var expanded = true;
+                        if (searching) { ImGui.TextDisabled(expansion.Key.Expansion); ImGui.Indent(12 * Scale); }
+                        else expanded = ImGui.TreeNode(expansion.Key.Expansion);
+                        if (expanded)
+                        {
+                            foreach (var duty in expansion) Row(duty.Id, duty.Name);
+                            if (searching) ImGui.Unindent(12 * Scale); else ImGui.TreePop();
+                        }
+                        ImGui.PopID();
+                    }
+                ImGui.PopID();
+            }
+            if (!found) ImGui.TextDisabled("No matching duties.");
+        }
         ImGui.EndChild();
     }
 }

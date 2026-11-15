@@ -32,7 +32,7 @@ internal sealed unsafe class PartyPreview : IDisposable
     private long requested, background, plateErrorId, manualId;
     private DateTimeOffset requestUntil, nextRequest, listingUntil, listingStarted, nextRead, nextListing;
     private DateTimeOffset listingErrorUntil, plateErrorUntil;
-    private bool listingFailure, plateFailure, manualPlate;
+    private bool listingFailure, plateFailure, manualPlate, namesChanged;
     [ThreadStatic] private static int quietSounds, mutedSystemCalls;
     private volatile bool enabled, keepLateReplies;
     internal Dictionary<ulong, PartyDetail> Parties { get; } = [];
@@ -44,6 +44,9 @@ internal sealed unsafe class PartyPreview : IDisposable
     internal bool PlatePending => Interlocked.Read(ref requested) != 0;
     internal bool ManualPlatePending => PlatePending && manualPlate;
     internal int CachedNames => names.Count;
+    internal int SummaryRosters { get; private set; }
+    internal int DetailRequests { get; private set; }
+    internal int PlateRequests { get; private set; }
     internal bool SuppressDetail => Busy || Volatile.Read(ref backgroundCallbacks) != 0;
     internal bool QuietAudioAvailable => soundHook is not null && systemSoundHook is not null;
     internal int SuppressedListingErrors { get; private set; }
@@ -190,10 +193,17 @@ internal sealed unsafe class PartyPreview : IDisposable
         if (id == 0 || name.Length == 0 || worldId == 0) return;
         CacheName(id, name, worldId, DateTimeOffset.UtcNow.AddMinutes(5));
     }
+    internal void ObserveListing(Listing listing)
+    {
+        Remember(listing.Leader, listing.Host, listing.HomeWorld);
+        if (Inspection.SingleMemberListing(listing) is { } detail && received.Count < 256)
+        { received.Enqueue(detail); SummaryRosters++; }
+    }
     private void CacheName(ulong id, string name, ushort worldId, DateTimeOffset until)
     {
         if (names.Count >= 4096 && !names.ContainsKey(id))
             foreach (var old in names.OrderBy(kv => kv.Value.Until).Take(512).Select(kv => kv.Key).ToArray()) names.Remove(old);
+        namesChanged |= !names.TryGetValue(id, out var previous) || previous.Name != name || previous.World != worldId;
         names[id] = (name, worldId, until);
     }
     private void ApplyNames()
@@ -212,7 +222,7 @@ internal sealed unsafe class PartyPreview : IDisposable
     internal void Tick(DateTimeOffset now)
     {
         Start();
-        if (now < nextRead && received.IsEmpty) return;
+        if (now < nextRead && received.IsEmpty && replies.IsEmpty && !namesChanged) return;
         nextRead = now.AddMilliseconds(200);
         var visible = native.VisibleDetailId;
         var owned = BackgroundId;
@@ -234,7 +244,7 @@ internal sealed unsafe class PartyPreview : IDisposable
                     if (NativePartyFinder.CopyDetail(&agent->LastViewedListing, now) is { } manual) received.Enqueue(manual);
             }
         }
-        var changed = false;
+        var changed = namesChanged; namesChanged = false;
         if (listingFailure)
         {
             var failed = BackgroundId;
@@ -291,6 +301,7 @@ internal sealed unsafe class PartyPreview : IDisposable
             Interlocked.Exchange(ref requested, (long)member.Id);
             Interlocked.Exchange(ref plateErrorId, (long)member.Id); plateErrorUntil = now.AddSeconds(7);
             nextRequest = now.AddMilliseconds(900); requestUntil = now.AddSeconds(5);
+            PlateRequests++;
             Quiet(() => { card->RequestCharaCardForContentId(member.Id); return true; }); return;
         }
     }
@@ -302,7 +313,7 @@ internal sealed unsafe class PartyPreview : IDisposable
         recentListings[id] = now.AddSeconds(30);
         Interlocked.Exchange(ref background, (long)id); listingStarted = now; listingUntil = now.AddSeconds(5); nextListing = now.AddSeconds(1);
         listingErrorUntil = listingUntil; listingFailure = false;
-        if (Quiet(() => native.OpenListing(id, false))) return true;
+        if (Quiet(() => native.OpenListing(id, false))) { DetailRequests++; return true; }
         Interlocked.Exchange(ref background, 0); return false;
     }
     internal void Pause(bool keepSound = false)

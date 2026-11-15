@@ -9,6 +9,8 @@ public sealed class SearchProfile
     public string Name = "Search 1";
     public bool Enabled = true;
     public HashSet<uint> Jobs = [];
+    public HashSet<uint> PreferredJobs = [];
+    public int PreferredFillAllowance;
     public HashSet<uint> Duties = [];
     public string Include = "", Exclude = "";
     public bool Regex;
@@ -18,15 +20,33 @@ public sealed class SearchProfile
     {
         Name = string.IsNullOrWhiteSpace(Name) ? "Search profile" : Name[..Math.Min(Name.Length, 80)];
         Jobs ??= []; Duties ??= [];
+        PreferredJobs ??= []; PreferredJobs.IntersectWith(Jobs);
+        PreferredFillAllowance = Math.Clamp(PreferredFillAllowance, 0, 2);
         Include = (Include ?? "")[..Math.Min(Include?.Length ?? 0, 2048)];
         Exclude = (Exclude ?? "")[..Math.Min(Exclude?.Length ?? 0, 2048)];
+    }
+    public void ToggleJob(uint job)
+    {
+        if (!Jobs.Remove(job)) Jobs.Add(job);
+        else PreferredJobs.Remove(job);
+    }
+    public void TogglePreference(uint job)
+    {
+        Jobs.Add(job);
+        if (!PreferredJobs.Add(job)) PreferredJobs.Remove(job);
+    }
+    public void ToggleRolePreference(Role role)
+    {
+        var selected = Jobs.Where(job => job <= byte.MaxValue && PartyScout.Core.Jobs.RoleOf((byte)job) == role).ToArray();
+        if (selected.All(PreferredJobs.Contains)) PreferredJobs.ExceptWith(selected);
+        else PreferredJobs.UnionWith(selected);
     }
 }
 
 public class Settings
 {
     public List<WatchedPlayer> CustomFriends = [];
-    public bool WatchFriends = true, WatchFreeCompany = true, WatchContacts = true;
+    public bool WatchFriends = true, WatchFreeCompany = true;
     public uint CurrentPartyDuty;
     public List<SearchProfile> Profiles = [];
     // Read the original single-search fields once when migrating existing configurations.
@@ -77,6 +97,7 @@ public static class Jobs
 {
     // Party Finder's job bits differ from ClassJob row IDs after THM.
     public static readonly byte[] Rows = [1, 2, 3, 4, 5, 6, 7, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42];
+    internal static bool InProfilePicker(uint job, bool selected) => selected || job >= 19 && job != 26;
     public static ulong Mask(uint row)
     {
         var index = Array.IndexOf(Rows, (byte)row);
@@ -117,20 +138,29 @@ public sealed record Listing(ulong Id, ulong Leader, uint Duty, bool IsDuty, str
 public sealed record Match(Listing Listing, int Score, uint[] PlayableJobs)
 {
     public string[] ProfileNames { get; init; } = [];
+    public bool UsesJobPreferences { get; init; }
+    public Dictionary<uint, double> JobPreferences { get; init; } = [];
+    public uint[] PreferredJobs => JobPreferences.OrderByDescending(pair => pair.Value).ThenBy(pair => pair.Key).Select(pair => pair.Key).ToArray();
+    public double PreferenceBonus => JobPreferences.Count == 0 ? 0 : JobPreferences.Values.Max();
+    public double Rank => UsesJobPreferences ? Listing.Filled + PreferenceBonus : Score;
+    public double RankForJob(uint job) => !PlayableJobs.Contains(job) ? double.NegativeInfinity :
+        UsesJobPreferences ? Listing.Filled + JobPreferences.GetValueOrDefault(job) : Score;
 }
 
 public sealed class ListingFilter
 {
     private readonly Settings settings;
     private readonly IReadOnlyDictionary<uint, int> dutySizes;
-    private readonly List<(SearchProfile Profile, Regex? Include, Regex? Exclude)> profiles = [];
+    private readonly List<(SearchProfile Profile, Regex? Include, Regex? Exclude, string[] IncludeTerms, string[] ExcludeTerms)> profiles = [];
     private readonly Dictionary<SearchProfile, string> errors = [];
     public string? Error => errors.Count == 0 ? null : string.Join("\n", errors.Select(e => $"{e.Key.Name}: {e.Value}"));
+    public bool UsesJobPreferences { get; }
 
     public ListingFilter(Settings settings, IReadOnlyDictionary<uint, int>? dutySizes = null)
     {
         this.settings = settings;
         this.dutySizes = dutySizes ?? new Dictionary<uint, int>();
+        UsesJobPreferences = settings.Profiles.Any(profile => profile.Enabled && profile.PreferredJobs.Overlaps(profile.Jobs));
         foreach (var profile in settings.Profiles.Where(p => p.Enabled))
         {
             try
@@ -138,7 +168,7 @@ public sealed class ListingFilter
                 const RegexOptions options = RegexOptions.IgnoreCase | RegexOptions.CultureInvariant;
                 var include = profile.Regex && profile.Include.Length > 0 ? new Regex(profile.Include, options, TimeSpan.FromMilliseconds(30)) : null;
                 var exclude = profile.Regex && profile.Exclude.Length > 0 ? new Regex(profile.Exclude, options, TimeSpan.FromMilliseconds(30)) : null;
-                profiles.Add((profile, include, exclude));
+                profiles.Add((profile, include, exclude, Terms(profile.Include), Terms(profile.Exclude)));
             }
             catch (ArgumentException) { errors[profile] = "Invalid regular expression. This profile is paused until corrected."; }
         }
@@ -149,7 +179,8 @@ public sealed class ListingFilter
         if (!listing.Fresh(now) || listing.Filled >= listing.Total || listing.Private) return null;
         var jobs = new HashSet<uint>();
         var names = new List<string>();
-        foreach (var (profile, include, exclude) in profiles)
+        var preferences = new Dictionary<uint, double>();
+        foreach (var (profile, include, exclude, includeTerms, excludeTerms) in profiles)
         {
             if (errors.ContainsKey(profile) || profile.Duties.Count > 0 && (!listing.IsDuty || !profile.Duties.Contains(listing.Duty))) continue;
             if (profile.RequireFullDutySize && listing.IsDuty && dutySizes.TryGetValue(listing.Duty, out var size) && size > 0 && listing.Total < size) continue;
@@ -160,15 +191,29 @@ public sealed class ListingFilter
                 var description = listing.Description;
                 var matches = profile.Regex
                     ? (include is null || include.IsMatch(description)) && (exclude is null || !exclude.IsMatch(description))
-                    : Terms(profile.Include).All(t => description.Contains(t, StringComparison.OrdinalIgnoreCase)) &&
-                      !Terms(profile.Exclude).Any(t => description.Contains(t, StringComparison.OrdinalIgnoreCase));
+                    : includeTerms.All(t => description.Contains(t, StringComparison.OrdinalIgnoreCase)) &&
+                      !excludeTerms.Any(t => description.Contains(t, StringComparison.OrdinalIgnoreCase));
                 if (!matches) continue;
                 jobs.UnionWith(playable); names.Add(profile.Name);
+                foreach (var job in playable.Where(profile.PreferredJobs.Contains))
+                    preferences[job] = Math.Max(preferences.GetValueOrDefault(job), .5 + profile.PreferredFillAllowance);
             }
             catch (RegexMatchTimeoutException) { errors[profile] = "Regular expression took too long. This profile is paused until corrected."; }
         }
         return jobs.Count == 0 ? null : new Match(listing, Jobs.Score(listing.JobsPresent.Take(listing.Total), settings), jobs.Order().ToArray())
-            { ProfileNames = names.Distinct().ToArray() };
+            { ProfileNames = names.Distinct().ToArray(), UsesJobPreferences = UsesJobPreferences, JobPreferences = preferences };
+    }
+
+    public double? CurrentRank(byte[] members, uint currentJob, uint duty = 0)
+    {
+        var score = Jobs.PartyScore(members, settings);
+        if (score is null || !UsesJobPreferences) return score;
+        if (currentJob > byte.MaxValue || !members.Contains((byte)currentJob)) return null;
+        var bonus = settings.Profiles.Where(profile => profile.Enabled && profile.Jobs.Contains(currentJob) &&
+            profile.PreferredJobs.Contains(currentJob) && (duty == 0 || profile.Duties.Count == 0 || profile.Duties.Contains(duty)))
+            .Select(profile => .5 + profile.PreferredFillAllowance).DefaultIfEmpty(0).Max();
+        // Listings do not include you yet; compare their other members with your party's other members.
+        return members.Length - 1 + bonus;
     }
 
     public bool InEnabledDuties(Listing listing) => settings.Profiles.Any(profile => profile.Enabled &&
@@ -183,23 +228,23 @@ public sealed class ListingFilter
 
 public sealed class AlertState
 {
-    private readonly Dictionary<ulong, int> dismissed = [];
-    private readonly Dictionary<ulong, int> announced = [];
+    private readonly Dictionary<ulong, double> dismissed = [];
+    private readonly Dictionary<ulong, double> announced = [];
     public Match? Target { get; private set; }
     public DateTimeOffset? Deadline { get; private set; }
 
-    public bool Update(IEnumerable<Match> matches, int? baseline, bool enabled, bool timed, int delay, DateTimeOffset now, uint currentJob)
+    public bool Update(IEnumerable<Match> matches, double? baseline, bool enabled, bool timed, int delay, DateTimeOffset now, uint currentJob)
     {
-        var best = enabled && baseline is { } baselineScore ? matches.FirstOrDefault(m => m.Score > baselineScore && m.Listing.Fresh(now) &&
-            (!dismissed.TryGetValue(m.Listing.Id, out var score) || m.Score > score)) : null;
+        var best = enabled && baseline is { } baselineScore ? matches.FirstOrDefault(m => m.Rank > baselineScore && m.Listing.Fresh(now) &&
+            (!dismissed.TryGetValue(m.Listing.Id, out var score) || m.Rank > score)) : null;
         var changed = best?.Listing.Id != Target?.Listing.Id;
-        timed = timed && best is not null && best.Listing.Parties == 1 && best.PlayableJobs.Contains(currentJob);
+        timed = timed && best is not null && best.Listing.Parties == 1 && best.RankForJob(currentJob) > baseline;
         if (changed) Deadline = best is not null && timed ? now.AddSeconds(delay) : null;
         if (!timed) Deadline = null;
         if (best is not null && timed && Deadline is null) Deadline = now.AddSeconds(delay);
         Target = best;
-        if (best is null || announced.TryGetValue(best.Listing.Id, out var previous) && best.Score <= previous) return false;
-        Remember(announced, best.Listing.Id, best.Score);
+        if (best is null || announced.TryGetValue(best.Listing.Id, out var previous) && best.Rank <= previous) return false;
+        Remember(announced, best.Listing.Id, best.Rank);
         return true;
     }
 
@@ -207,7 +252,7 @@ public sealed class AlertState
     {
         if ((match ?? Target) is { } target)
         {
-            var score = Target?.Listing.Id == target.Listing.Id ? Math.Max(target.Score, Target.Score) : target.Score;
+            var score = Target?.Listing.Id == target.Listing.Id ? Math.Max(target.Rank, Target.Rank) : target.Rank;
             Remember(dismissed, target.Listing.Id, Math.Max(score, dismissed.GetValueOrDefault(target.Listing.Id, -1)));
             if (Target?.Listing.Id == target.Listing.Id) Clear();
         }
@@ -217,13 +262,13 @@ public sealed class AlertState
     {
         foreach (var match in matches)
         {
-            Remember(dismissed, match.Listing.Id, match.Score);
-            Remember(announced, match.Listing.Id, match.Score);
+            Remember(dismissed, match.Listing.Id, match.Rank);
+            Remember(announced, match.Listing.Id, match.Rank);
         }
         Clear();
     }
     public void Reset() { Clear(); dismissed.Clear(); announced.Clear(); }
-    private static void Remember(Dictionary<ulong, int> history, ulong id, int score)
+    private static void Remember(Dictionary<ulong, double> history, ulong id, double score)
     {
         if (history.Count >= 2048 && !history.ContainsKey(id)) history.Remove(history.Keys.First());
         history[id] = score;

@@ -2,6 +2,8 @@ namespace PartyScout.Core;
 
 internal static class SweepPolicy
 {
+    internal static bool OwnsDetail(ulong requested, ulong displayed) => requested != 0 && requested == displayed;
+
     internal static HashSet<ulong> PageListingIds(ReadOnlySpan<ulong> ids, int count) =>
         ids[..Math.Clamp(count, 0, ids.Length)].ToArray().Where(id => id != 0).ToHashSet();
 

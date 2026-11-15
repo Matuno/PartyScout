@@ -92,10 +92,11 @@ internal sealed class PlayerLookups : IDisposable
             if (LodestoneRoster.Pagination(html, page, 512) != (memberPages, memberTotal)) throw new InvalidDataException("The free company roster changed while loading.");
             members.AddRange(LodestoneRoster.MemberPage(html));
         }
-        if (members.Count != memberTotal || members.Any(m => !m.World.Equals(world, StringComparison.OrdinalIgnoreCase)) ||
+        var names = members.Select(m => m.Name).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        if (members.Count != memberTotal || names.Length != memberTotal || members.Any(m => !m.World.Equals(world, StringComparison.OrdinalIgnoreCase)) ||
             !members.Any(m => m.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
             throw new InvalidDataException("The complete free company roster could not be verified.");
-        return members.Select(m => m.Name).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        return names;
     }
 
     internal async Task<TomestoneCharacterInfo> Tomestone(PreviewMember member, string duty, Credentials credentials, CancellationToken ct)

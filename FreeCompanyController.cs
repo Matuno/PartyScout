@@ -13,7 +13,7 @@ public sealed partial class Plugin
 
     private void UpdateCompanyRoster(DateTimeOffset now, ulong knownCompany)
     {
-        if (!Settings.WatchContacts || !Settings.WatchFreeCompany || !player.IsLoaded || player.ContentId == 0) return;
+        if (!ContactActive || !Settings.WatchFreeCompany || !player.IsLoaded || player.ContentId == 0) return;
         var owner = player.ContentId;
         if (companyOwner != 0 && companyOwner != owner) ClearCompanyRoster();
         companyOwner = owner;
@@ -33,8 +33,8 @@ public sealed partial class Plugin
                 var members = await lookups.FreeCompany(name, world, knownCompany, ct).ConfigureAwait(false);
                 Post(() =>
                 {
-                    if (generation != companyGeneration || ct.IsCancellationRequested || !Active ||
-                        !Settings.WatchContacts || !Settings.WatchFreeCompany || player.ContentId != owner) return;
+                    if (generation != companyGeneration || ct.IsCancellationRequested || !ContactActive ||
+                        !Settings.WatchFreeCompany || player.ContentId != owner) return;
                     companyRoster = members.Select(m => (m.Trim().ToUpperInvariant(), worldId)).ToHashSet();
                     companyStatus = $"FC public {companyRoster.Count} (Lodestone)";
                     nextCompanyLookup = DateTimeOffset.UtcNow.AddHours(6); ResetSocialHits();
@@ -45,7 +45,7 @@ public sealed partial class Plugin
             {
                 Post(() =>
                 {
-                    if (generation != companyGeneration || ct.IsCancellationRequested || !Active) return;
+                    if (generation != companyGeneration || ct.IsCancellationRequested || !ContactActive) return;
                     companyStatus = "FC public roster unavailable; retrying later";
                     nextCompanyLookup = DateTimeOffset.UtcNow.AddMinutes(5);
                 });

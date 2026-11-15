@@ -9,19 +9,22 @@ public sealed partial class Plugin
     private readonly HashSet<ulong> scanAttemptedDetails = [];
     private readonly CollectionQueue socialCollectionQueue = new();
     private readonly HashSet<string> scannedPages = [];
-    private bool socialSweepRequested, scanPageNeedsSnapshot, inspectionSweep, ownsFinder, profileRefreshPending;
+    private bool socialSweepRequested, scanPageNeedsSnapshot, inspectionSweep, ownsFinder, profileRefreshPending, batchEnded;
     private volatile bool openingFinder;
     private int scanStage, completedSweeps, lastSweepPages;
     private string previousPage = "";
     private DateTimeOffset nextScanStep, scanUntil, pageUntil, scanPageDeadline, nextSweepRestart, nextSocialHits, scanReadyUntil, refreshAttemptUntil, scanBlockedSince;
     private DateTimeOffset profileRefreshUntil, nextProfileAttempt;
+    private DateTimeOffset batchStarted;
+    internal int EarlyListingBatches { get; private set; }
+    internal double LastListingBatchMs { get; private set; }
     private SocialHit[] cachedSocialHits = [];
     internal bool Scanning { get; private set; }
     internal bool BrowseAll { get; private set; }
-    private bool WantsSweep => Settings.WatchContacts || BrowseAll || inspectionSweep;
+    private bool WantsSweep => ContactActive || BrowseAll || inspectionSweep;
     private bool CanStartSweep(DateTimeOffset now) => WantsSweep && !Scanning && !Joining && !profileRefreshPending &&
         !preview.DetailOpen && !windows.NativeFinderInteracting && !native.AdventurerPlateOpen() && now >= nextSweepRestart;
-    internal string ScanStatus { get; private set; } = "Contact scanning starts with Watch.";
+    internal string ScanStatus { get; private set; } = "Contact scanning is paused.";
     internal int InitialRefreshAttempts { get; private set; }
     internal bool? LastInitialRefreshAccepted { get; private set; }
     internal int ScannedListings => socialListings.Count;
@@ -46,7 +49,8 @@ public sealed partial class Plugin
     }
     private void TickProfileRefresh(DateTimeOffset now)
     {
-        if (Scanning || collecting || Joining || preview.Busy || now < nextRefresh) return;
+        if (!Active || Scanning || collecting || Joining || preview.Busy || preview.DetailOpen ||
+            windows.NativeFinderInteracting || native.AdventurerPlateOpen() || now < nextRefresh) return;
         if (!profileRefreshPending)
         {
             profileRefreshPending = true; profileRefreshUntil = now.AddSeconds(15); nextProfileAttempt = now.AddMilliseconds(500);
@@ -59,8 +63,32 @@ public sealed partial class Plugin
         if (!native.FinderReady) return;
         nextProfileAttempt = now.AddSeconds(2);
         if (!preview.Quiet(native.Refresh)) return;
-        profileRefreshPending = false; collecting = true; collectingUntil = now.AddSeconds(3);
+        profileRefreshPending = false; collecting = true; batchEnded = false; batchStarted = now; collectingUntil = now.AddSeconds(3);
         nextRefresh = now.AddSeconds(10); batch.Clear();
+    }
+    private bool FinishListingBatch(DateTimeOffset now)
+    {
+        var page = native.Page();
+        var visible = native.PageListingIds();
+        var count = batch.Keys.Count(visible.Contains);
+        var pageReady = page is not null && (!Scanning || page.Area == 0 && page.Category == 0 &&
+            (scanStage != 2 || PageKey(page) != previousPage));
+        var pageComplete = pageReady && count >= page!.ExpectedListings;
+        var complete = pageComplete && page!.ExpectedListings > 0 && batchEnded && count == batch.Count;
+        if (!complete && now < collectingUntil) return false;
+        if (Scanning && scanPageNeedsSnapshot && !pageComplete && now < pageUntil)
+        { collectingUntil = now.AddSeconds(1); return false; }
+        if (complete && now < collectingUntil) EarlyListingBatches++;
+        LastListingBatchMs = (now - batchStarted).TotalMilliseconds;
+        lastBatchCount = Scanning && scanPageNeedsSnapshot ? count : batch.Count;
+        foreach (var listing in batch.Values)
+        {
+            RememberListing(listing);
+            if (Scanning && scanPageNeedsSnapshot && visible.Contains(listing.Id)) scanPageListings[listing.Id] = listing;
+        }
+        batch.Clear(); collecting = false; LastRefresh = now;
+        if (Scanning && scanPageNeedsSnapshot) nextScanStep = now;
+        return true;
     }
     internal SocialHit[] SocialHits
     {
@@ -96,8 +124,10 @@ public sealed partial class Plugin
 
     internal void StartScan()
     {
-        if (!Active || Joining) { ActionStatus("Start Watch before scanning Party Finder."); return; }
-        Settings.WatchContacts = true; Save();
+        if (!windows.ContactsOpen || Joining || !SafeToMonitor()) { ScanStatus = "Available when logged in, outside duties and combat."; return; }
+        var wasRunning = Running;
+        contactActive = true;
+        if (!wasRunning) StartEngine();
         preview.Quiet(() => { native.RefreshSocial(); return true; }); nextSocialRead = default;
         if (Scanning) socialSweepRequested = true; else StartSweep();
     }
@@ -111,7 +141,7 @@ public sealed partial class Plugin
     internal void RequestInspectionSweep()
     {
         inspectionSweep = true;
-        if (Active && !Joining && !Scanning) StartSweep();
+        if (Running && !Joining && !Scanning) StartSweep();
     }
     internal void FinishInspectionSweep()
     {
@@ -120,10 +150,10 @@ public sealed partial class Plugin
     }
     private void StartSweep()
     {
-        if (!Active || Joining || Scanning || !WantsSweep) return;
+        if (!Running || Joining || Scanning || !WantsSweep) return;
         var now = DateTimeOffset.UtcNow;
         profileRefreshPending = false;
-        Scanning = true; socialSweepRequested = Settings.WatchContacts; scanStage = 0; previousPage = ""; nextScanStep = default;
+        Scanning = true; socialSweepRequested = ContactActive; scanStage = 0; previousPage = ""; nextScanStep = default;
         InitialRefreshAttempts = 0; LastInitialRefreshAccepted = null; refreshAttemptUntil = scanBlockedSince = default;
         scannedPages.Clear(); scanPageListings.Clear(); scanAttemptedDetails.Clear();
         scanPageNeedsSnapshot = false; scanUntil = now.AddMinutes(20); scanReadyUntil = now.AddSeconds(15); nextRefresh = now.AddSeconds(10);
@@ -132,9 +162,10 @@ public sealed partial class Plugin
     }
     internal void StopScan()
     {
-        Settings.WatchContacts = false; Save();
+        contactActive = false; CancelCompanyLookup();
         if ((BrowseAll || inspectionSweep) && Scanning) { socialSweepRequested = false; ScanStatus = "Contact scanning paused; listing sweep continues."; }
         else PauseScan("Contact scanning paused.");
+        if (!Active) Stop("Contact scanning stopped.");
     }
     private void PauseScan(string reason)
     {
@@ -142,14 +173,15 @@ public sealed partial class Plugin
         nextSweepRestart = DateTimeOffset.UtcNow.AddSeconds(2);
         ScanStatus = reason;
     }
-    internal void RefreshSocialRosters() { if (Active) { preview.Quiet(() => { native.RefreshSocial(); return true; }); nextSocialRead = default; RefreshCompanyRoster(); } }
+    internal void RefreshSocialRosters() { if (ContactActive) { preview.Quiet(() => { native.RefreshSocial(); return true; }); nextSocialRead = default; RefreshCompanyRoster(); } }
     private bool PageCollectionPending(DateTimeOffset now)
     {
         var visible = native.PageListingIds();
-        bool Fresh(Listing listing) => preview.Parties.TryGetValue(listing.Id, out var detail) && CollectionQueue.IsFresh(listing, detail, now);
-        return scanPageListings.Values.Where(l => SweepPolicy.OnPage(l, visible, now) &&
-                (socialSweepRequested || l.Id == selectedListing || Matches.Any(m => m.Listing.Id == l.Id)))
-            .Any(l => !scanAttemptedDetails.Contains(l.Id) && !Fresh(l));
+        var profiles = Matches.Select(m => m.Listing.Id).ToHashSet();
+        return scanPageListings.Values.Where(l => SweepPolicy.OnPage(l, visible, now) && !scanAttemptedDetails.Contains(l.Id))
+            .Any(l => (profiles.Contains(l.Id) ? collectionQueue.CanRequest(l, preview.Parties, now) :
+                socialSweepRequested && socialCollectionQueue.CanRequest(l, preview.Parties, now)) ||
+                l.Id == selectedListing && now >= nextSelectedRequest && !CollectionQueue.IsFresh(l, preview.Parties.GetValueOrDefault(l.Id), now));
     }
     private void TickScan(DateTimeOffset now)
     {
@@ -225,7 +257,7 @@ public sealed partial class Plugin
     private static string PageKey(FinderPage page) => SweepPolicy.PageKey(page.Key);
     private void BeginPage(DateTimeOffset now)
     {
-        collecting = true; batch.Clear(); scanPageListings.Clear(); scanPageNeedsSnapshot = true; lastBatchCount = 0;
+        collecting = true; batchEnded = false; batchStarted = now; batch.Clear(); scanPageListings.Clear(); scanPageNeedsSnapshot = true; lastBatchCount = 0;
         collectingUntil = now.AddSeconds(3); nextScanStep = now.AddSeconds(3); scanPageDeadline = now.AddSeconds(8); pageUntil = now.AddSeconds(15);
     }
 }

@@ -4,7 +4,7 @@
 
 Find the right party and see who's playing.
 
-- Search Party Finder by job, duty and keywords.
+- Search Party Finder with job, duty and keyword profiles, and favour preferred jobs.
 - View matching parties, their members and available progress and performance.
 - Find friends, free company members and custom contacts.
 - Get alerts or opt in to automatic party switching.
