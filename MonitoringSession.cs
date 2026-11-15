@@ -6,12 +6,11 @@ public sealed partial class Plugin
     {
         var wasActive = Running;
         FinishJoin(true);
-        Active = Automation = false;
-        Alert.Reset(); Inbox.Clear(); DismissToast(); BrowseAll = inspectionSweep = profileRefreshPending = false;
+        Active = Automation = contactActive = false;
+        CancelCompanyLookup();
+        Alert.Reset(); Inbox.Clear(); DismissToast(); BrowseAll = profileRefreshPending = false;
         Matches = []; OverviewMatches = []; OverviewListings = []; CurrentListing = null;
-        if (closeNative) { contactActive = false; windows.ContactsOpen = false; }
         CancelLookups(clearCache: !Running);
-        if (Running) { Status = reason; return; }
         collecting = false;
         pf.ReceiveListing -= Receive;
         preview.Quiet(() =>
@@ -22,7 +21,7 @@ public sealed partial class Plugin
             preview.Stop(); native.RestoreHiddenInputs(); return true;
         });
         ownsFinder = openingFinder = profileRefreshPending = passivePreview = false;
-        ClearCompanyRoster(); Scanning = socialSweepRequested = BrowseAll = inspectionSweep = false; socialListings.Clear(); ResetSocialHits(); scanPageListings.Clear(); scanAttemptedDetails.Clear(); socialCollectionQueue.Clear(); scannedPages.Clear();
+        ClearCompanyRoster(); Scanning = socialSweepRequested = BrowseAll = false; socialListings.Clear(); ResetSocialHits(); scanPageListings.Clear(); scanAttemptedDetails.Clear(); socialCollectionQueue.Clear(); scannedPages.Clear();
         Status = reason;
         listings.Clear(); batch.Clear();
         while (incoming.TryDequeue(out _)) { }

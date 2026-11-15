@@ -11,42 +11,78 @@ internal sealed partial class ScoutWindows
     private void Setup()
     {
         selectedProfile = Math.Clamp(selectedProfile, 0, C.Profiles.Count - 1);
-        var height = ImGui.GetContentRegionAvail().Y;
-        if (ImGui.BeginChild("Profiles", new Vector2(112 * Scale, height), false))
+        var fontSize = ImGui.GetFontSize();
+        using (ImRaii.PushColor(ImGuiCol.ChildBg, palette.Panel))
+        using (ImRaii.PushStyle(ImGuiStyleVar.WindowPadding, new Vector2(8, 8) * Scale))
         {
-            ImGui.TextDisabled("PROFILES");
-            if (Icon(FontAwesomeIcon.Plus, "addProfile", "Add search profile", new Vector2(ImGui.GetFrameHeight())))
+            if (ImGui.BeginChild("SearchList", new Vector2(148 * Scale, 0), false, ImGuiWindowFlags.AlwaysUseWindowPadding))
             {
-                C.Profiles.Add(new SearchProfile { Name = $"Search {C.Profiles.Count + 1}" });
-                selectedProfile = C.Profiles.Count - 1; dutySearch = ""; p.Post(p.Changed);
-            }
-            ImGui.SameLine();
-            using (ImRaii.Disabled(C.Profiles.Count == 1))
-                if (Icon(FontAwesomeIcon.Trash, "removeProfile", "Remove selected profile", new Vector2(ImGui.GetFrameHeight())))
-                { C.Profiles.RemoveAt(selectedProfile); selectedProfile = Math.Max(0, selectedProfile - 1); dutySearch = ""; p.Post(p.Changed); }
-            for (var i = 0; i < C.Profiles.Count; i++)
-            {
-                var item = C.Profiles[i];
-                ImGui.PushID(i);
-                if (ImGui.Checkbox("##Enabled", ref item.Enabled)) p.Post(p.Changed);
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(item.Enabled ? "Pause this profile" : "Enable this profile");
+                MatchParentFontSize(fontSize);
+                SectionTitle("Your searches");
+                var footer = ImGui.GetFrameHeightWithSpacing();
+                var listFont = ImGui.GetFontSize();
+                if (ImGui.BeginChild("SearchItems", new Vector2(0, Math.Max(1, ImGui.GetContentRegionAvail().Y - footer)), false))
+                {
+                    MatchParentFontSize(listFont);
+                    for (var i = 0; i < C.Profiles.Count; i++)
+                    {
+                        var item = C.Profiles[i];
+                        ImGui.PushID(i);
+                        if (ImGui.Checkbox("##Enabled", ref item.Enabled)) p.Post(p.Changed);
+                        if (ImGui.IsItemHovered()) ImGui.SetTooltip(item.Enabled ? "Pause this search" : "Enable this search");
+                        ImGui.SameLine();
+                        if (ImGui.Selectable(Fit(item.Name, ImGui.GetContentRegionAvail().X) + "##Profile", i == selectedProfile))
+                        { selectedProfile = i; dutySearch = ""; }
+                        if (ImGui.IsItemHovered()) ImGui.SetTooltip(item.Name);
+                        var jobs = item.Jobs.Count == 0 ? "No jobs" : p.JobNames(p.JobChoices.Where(job => item.Jobs.Contains(job.Id)).Select(job => job.Id));
+                        var duties = item.Duties.Count == 0 ? "All duties" : item.Duties.Count == 1 ? p.DutyLabel(item.Duties.First()) : $"{item.Duties.Count} duties";
+                        var summary = (item.Jobs.Count > 1 ? $"{item.Jobs.Count} jobs" : jobs) + " · " + duties;
+                        ImGui.Indent(ImGui.GetFrameHeight() + ImGui.GetStyle().ItemSpacing.X);
+                        using (ImRaii.PushColor(ImGuiCol.Text, Muted))
+                            if (ImGui.Selectable(Fit(summary, ImGui.GetContentRegionAvail().X) + "##Summary"))
+                            { selectedProfile = i; dutySearch = ""; }
+                        if (ImGui.IsItemHovered()) ImGui.SetTooltip(duties + "\n" + jobs);
+                        ImGui.Unindent(ImGui.GetFrameHeight() + ImGui.GetStyle().ItemSpacing.X);
+                        ImGui.PopID();
+                    }
+                }
+                ImGui.EndChild();
+                if (Icon(FontAwesomeIcon.Plus, "addProfile", "Add search", new Vector2(ImGui.GetFrameHeight())))
+                {
+                    C.Profiles.Add(new SearchProfile { Name = $"Search {C.Profiles.Count + 1}" });
+                    selectedProfile = C.Profiles.Count - 1; dutySearch = ""; p.Post(p.Changed);
+                }
                 ImGui.SameLine();
-                if (ImGui.Selectable(item.Name + "##Profile", i == selectedProfile)) { selectedProfile = i; dutySearch = ""; }
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(item.Name);
-                ImGui.PopID();
+                using (ImRaii.Disabled(C.Profiles.Count == 1))
+                    if (Icon(FontAwesomeIcon.Trash, "removeProfile", "Delete selected search", new Vector2(ImGui.GetFrameHeight()))) ImGui.OpenPopup("DeleteSearch");
+                if (ImGui.BeginPopup("DeleteSearch"))
+                {
+                    ImGui.TextUnformatted("Delete this search?");
+                    if (ImGui.Button("Delete"))
+                    {
+                        C.Profiles.RemoveAt(selectedProfile); selectedProfile = Math.Max(0, selectedProfile - 1);
+                        dutySearch = ""; p.Post(p.Changed); ImGui.CloseCurrentPopup();
+                    }
+                    ImGui.SameLine(); if (ImGui.Button("Cancel")) ImGui.CloseCurrentPopup();
+                    ImGui.EndPopup();
+                }
             }
+            ImGui.EndChild();
         }
-        ImGui.EndChild(); ImGui.SameLine();
+        ImGui.SameLine();
+        var profile = C.Profiles[selectedProfile];
         if (ImGui.BeginChild("ProfileEditor", Vector2.Zero, false))
         {
-            var profile = C.Profiles[selectedProfile];
+            MatchParentFontSize(fontSize);
+            FieldLabel("Search name");
             ImGui.SetNextItemWidth(-1);
-            if (ImGui.InputTextWithHint("##ProfileName", "Profile name", ref profile.Name, 80)) p.Post(p.Save);
-            if (ImGui.CollapsingHeader("Jobs", ImGuiTreeNodeFlags.DefaultOpen)) JobPicker(profile);
-            ImGui.SetNextItemWidth(-1);
-            ImGui.SetNextWindowSizeConstraints(new Vector2(360, 0) * Scale, new Vector2(520, 300) * Scale);
+            if (ImGui.InputTextWithHint("##ProfileName", "Search name", ref profile.Name, 80)) p.Post(p.Save);
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Search name · saved automatically");
+            if (ImGui.Checkbox("Search enabled", ref profile.Enabled)) p.Post(p.Changed);
+            ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing();
+            SectionTitle("Duties");
             var dutyLabel = profile.Duties.Count == 0 ? "All duties" : profile.Duties.Count == 1 ? p.DutyLabel(profile.Duties.First()) : $"{profile.Duties.Count} duties";
-            if (ImGui.BeginCombo("##Duties", dutyLabel))
+            if (BeginDutyPicker("##Duties", dutyLabel))
             {
                 ImGui.SetNextItemWidth(-1); ImGui.InputTextWithHint("##DutySearch", "Search duties…", ref dutySearch, 150);
                 using (ImRaii.Disabled(profile.Duties.Count == 0))
@@ -57,38 +93,39 @@ internal sealed partial class ScoutWindows
             }
             if (ImGui.Checkbox("Require full duty size", ref profile.RequireFullDutySize)) p.Post(p.Changed);
             if (ImGui.IsItemHovered()) ImGui.SetTooltip("Exclude listings with fewer total slots than the duty requires. Unknown sizes are not filtered.");
-            if (ImGui.Checkbox("Regex", ref profile.Regex)) p.Post(p.Changed);
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Case insensitive. Terms: include ALL, exclude ANY; separate with commas or newlines. Regex: one pattern per field.");
-            if (ImGui.BeginTable("Terms", 2, ImGuiTableFlags.SizingStretchSame))
+            ImGui.Spacing();
+            if (SectionDisclosure("Jobs & preferences", ImGuiTreeNodeFlags.DefaultOpen)) JobPicker(profile);
+            ImGui.Spacing();
+            if (SectionDisclosure("Description filters", ImGuiTreeNodeFlags.DefaultOpen))
             {
-                ImGui.TableNextColumn(); ImGui.TextDisabled(profile.Regex ? "Include pattern" : "Include all");
-                if (ImGui.InputTextMultiline("##Include", ref profile.Include, 2048, new Vector2(-1, 42 * Scale))) p.Post(p.Changed);
-                ImGui.TableNextColumn(); ImGui.TextDisabled(profile.Regex ? "Exclude pattern" : "Exclude any");
-                if (ImGui.InputTextMultiline("##Exclude", ref profile.Exclude, 2048, new Vector2(-1, 42 * Scale))) p.Post(p.Changed);
-                ImGui.EndTable();
-            }
-            if (ImGui.CollapsingHeader("Weights & response · all profiles"))
-            {
-                ImGui.TextWrapped(p.UsesJobPreferences ? "Fill and job preference rank first; role points break ties. Parses never affect ranking." : "Points per filled member. Parses never affect ranking.");
-                foreach (var role in Enum.GetValues<Role>())
+                if (ImGui.Checkbox("Regex", ref profile.Regex)) p.Post(p.Changed);
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip("Case insensitive. Terms: include ALL, exclude ANY; separate with commas or newlines. Regex: one pattern per field.");
+                if (ImGui.BeginTable("Terms", 2, ImGuiTableFlags.SizingStretchSame))
                 {
-                    ImGui.SetNextItemWidth(110 * Scale);
-                    if (ImGui.SliderInt(RoleName(role), ref C.RoleWeights[(int)role], 0, 100)) p.Post(p.Changed);
+                    ImGui.TableNextColumn(); FieldLabel(profile.Regex ? "Include pattern" : "Include all");
+                    if (ImGui.InputTextMultiline("##Include", ref profile.Include, 2048, new Vector2(-1, 42 * Scale))) p.Post(p.Changed);
+                    ImGui.TableNextColumn(); FieldLabel(profile.Regex ? "Exclude pattern" : "Exclude any");
+                    if (ImGui.InputTextMultiline("##Exclude", ref profile.Exclude, 2048, new Vector2(-1, 42 * Scale))) p.Post(p.Changed);
+                    ImGui.EndTable();
                 }
-                if (ImGui.Checkbox("Better-match popup", ref C.Alerts)) p.Post(p.AlertsChanged);
-                if (ImGui.Checkbox("Join if I do not respond", ref C.TimedJoin))
-                    p.Post(() => { p.Changed(); if (C.TimedJoin && p.Active && !p.Automation) p.ToggleAutomation(); });
-                if (C.TimedJoin)
-                {
-                    ImGui.SetNextItemWidth(110 * Scale);
-                    if (ImGui.SliderInt("Seconds to respond", ref C.JoinDelay, 10, 300)) p.Post(p.Changed);
-                }
-                ImGui.TextWrapped("Switching leaves your current party. A target can fill before you join. Stop Auto cancels the remaining steps.");
             }
+            ImGui.Spacing();
+            if (ImGui.SmallButton("Ranking & alerts")) ShowSettings(0);
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Shared preferences for all searches");
             if (p.FilterError is { } error) ImGui.TextWrapped(error);
             if (p.SaveError is { } saveError) ImGui.TextWrapped(saveError);
         }
         ImGui.EndChild();
+    }
+    private bool BeginDutyPicker(string id, string label)
+    {
+        var width = Math.Max(1, Math.Min(ImGui.GetContentRegionAvail().X, 520 * Scale));
+        var parentFontSize = ImGui.GetFontSize();
+        ImGui.SetNextItemWidth(width);
+        ImGui.SetNextWindowSizeConstraints(new Vector2(width, 0), new Vector2(width, 300 * Scale));
+        if (!ImGui.BeginCombo(id, label)) return false;
+        MatchParentFontSize(parentFontSize);
+        return true;
     }
     private void JobPicker(SearchProfile profile)
     {
@@ -135,7 +172,7 @@ internal sealed partial class ScoutWindows
         }
         ImGui.TextColored(Gold, "Starred = preferred");
         if (profile.Jobs.Count == 0) ImGui.TextColored(Gold, "Choose at least one job.");
-        ImGui.TextDisabled("Favour preferred jobs"); ImGui.SetNextItemWidth(-1);
+        FieldLabel("Favour preferred jobs"); ImGui.SetNextItemWidth(-1);
         if (ImGui.Combo("##PreferenceFill", ref profile.PreferredFillAllowance, "At equal fill\0Allow 1 fewer member\0Allow 2 fewer members\0")) p.Post(p.Changed);
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Preferred jobs can outweigh this many fewer filled slots. Multiple preferred vacancies count once. Without stars on any enabled profile, ranking uses role points.");
     }
@@ -149,14 +186,14 @@ internal sealed partial class ScoutWindows
                 choose(id);
         }
 
-        ImGui.TextDisabled("SELECTED");
+        SectionTitle("Selected");
         if (ImGui.BeginChild("SelectedDuties", new Vector2(0, 2 * ImGui.GetFrameHeightWithSpacing()), false))
         {
             if (selected.Count == 0) ImGui.TextDisabled(multiple ? "All duties" : "No duty selected");
             else
             {
                 ImGui.PushID("selected");
-                foreach (var id in selected.OrderBy(p.DutyLabel, StringComparer.CurrentCultureIgnoreCase).ToArray()) Row(id, p.DutyLabel(id));
+                foreach (var id in selected.OrderByDescending(id => id).ToArray()) Row(id, p.DutyLabel(id));
                 ImGui.PopID();
             }
         }
@@ -174,7 +211,7 @@ internal sealed partial class ScoutWindows
                 var label = DutyPicker.Label(group.Key);
                 var open = true;
                 if (searching) ImGui.TextColored(Accent, label);
-                else open = ImGui.CollapsingHeader(label);
+                else open = SectionDisclosure(label);
                 if (open)
                     foreach (var expansion in group.Where(duty => DutyPicker.Matches(duty, query)).GroupBy(duty => (duty.ExpansionId, duty.Expansion)))
                     {

@@ -34,6 +34,9 @@ internal static class Social
 
 internal static class SlotRoles
 {
+    internal static bool CanPlay(ulong mask, bool occupied, IEnumerable<uint> jobs) =>
+        !occupied && jobs.Any(job => (mask & Jobs.Mask(job)) != 0);
+
     // PF uses one DPS colour for all three DPS roles.
     internal static int[] Colors(ulong mask) => Jobs.Rows.Where(j => (mask & Jobs.Mask(j)) != 0)
         .Select(j => Jobs.RoleOf(j) switch { Role.Tank => 0, Role.Healer => 1, Role.Melee or Role.Ranged or Role.Caster => 2, _ => -1 })

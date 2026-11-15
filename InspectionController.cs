@@ -14,18 +14,22 @@ public sealed partial class Plugin
     private Task? lookupTask;
     private int inspectionGeneration;
     private ulong selectedListing, lastManual;
+    private Listing? nativeInspectionPending;
+    private long nativeInspectionId;
+    private DateTimeOffset nativeInspectionUntil;
     private readonly CurrentPartyContext partyContext = new();
     private Listing? lastNativeListing;
     private DateTimeOffset lastNativeSeen;
     private bool passivePreview;
-    private DateTimeOffset nextPartyRead, nextSocialRead, nextCollection, nextSelectedRequest, progressRetry, parsesRetry;
+    private int profileDetailRequests, contactDetailRequests, offPageDetailRequests;
+    private DateTimeOffset nextPartyRead, nextSocialRead, nextCollection, progressRetry, parsesRetry;
     private readonly Dictionary<uint, string> englishDuties;
     private readonly Dictionary<ulong, SocialPerson> socialPeople = [];
     internal PartyDetail? CurrentParty { get; private set; }
-    internal PartyDetail? NativeParty => View.Detail is { } window && FinderVisibility.ShowDetailOverlay(Running, showNativeFinder, Joining, preview.SuppressDetail, window.ListingId, preview.ManualId)
+    private bool NativeInspectionVisible => (ulong)Interlocked.Read(ref nativeInspectionId) is var id && id != 0 && preview.ManualId == id;
+    internal PartyDetail? NativeParty => View.Detail is { } window && FinderVisibility.ShowDetailOverlay(Running, showNativeFinder, Joining, preview.SuppressDetail, window.ListingId, preview.ManualId, NativeInspectionVisible)
         ? preview.Parties.GetValueOrDefault(window.ListingId) : null;
     internal PartyDetail? Inspected => Collected(selectedListing);
-    internal bool HasInspection => selectedListing != 0;
     internal string? PreviewError => preview.Error;
     internal bool LookupBusy => lookupTask is { IsCompleted: false };
     internal string LookupStatus { get; private set; } = "Collecting matched parties in the background.";
@@ -43,17 +47,38 @@ public sealed partial class Plugin
     }
     internal MemberData? DataFor(PreviewMember member, uint duty) => memberData.GetValueOrDefault(Inspection.MemberKey(member, duty));
     internal SocialKind Relation(PreviewMember member) => Social.Match(member, socialPeople, Settings, companyRoster);
-    internal string InspectedDuty => Inspected is { } d ? DutyLabel(d.Duty) : "";
     internal string DutyLabel(uint duty) => DutyChoices.FirstOrDefault(d => d.Id == duty).Name ?? (duty == 0 ? "Select duty" : $"Duty {duty}");
 
     internal void Inspect(Listing listing)
     {
         if (!Running || Joining || listing.Expires <= DateTimeOffset.UtcNow) { ActionStatus("Start monitoring and select an available listing to inspect."); return; }
         if (selectedListing != listing.Id) CancelLookups();
-        selectedListing = listing.Id; nextSelectedRequest = default;
-        if (Collected(listing.Id) is null && (!native.FinderReady || !native.PageListingIds().Contains(listing.Id))) RequestInspectionSweep();
-        else FinishInspectionSweep();
-        windows.ShowParty(); Save();
+        selectedListing = listing.Id;
+        if (Scanning) PauseScan("Contact scanning paused while opening a party.");
+        nativeInspectionPending = listing; nativeInspectionUntil = DateTimeOffset.UtcNow.AddSeconds(15);
+        ActionStatus("Opening party details…");
+    }
+    private void TickNativeInspection(DateTimeOffset now)
+    {
+        if (nativeInspectionPending is not { } listing)
+        {
+            if (preview.ManualId == 0 || !NativeInspectionVisible) Interlocked.Exchange(ref nativeInspectionId, 0);
+            return;
+        }
+        if (now >= nativeInspectionUntil || listing.Expires <= now)
+        { nativeInspectionPending = null; ActionStatus("Party details could not be opened; the listing may have expired."); return; }
+        if (collecting || preview.Busy) return;
+        if (!native.FinderActive) { OpenFinderForWork(); return; }
+        if (!native.FinderReady) return;
+        native.SetManualDetailHidden(false);
+        preview.ExpectManual(listing.Id, now);
+        Interlocked.Exchange(ref nativeInspectionId, unchecked((long)listing.Id));
+        nativeInspectionPending = null;
+        if (!native.OpenListing(listing.Id))
+        {
+            preview.CancelExpectedManual(); Interlocked.Exchange(ref nativeInspectionId, 0);
+            ActionStatus("The game could not open this listing. It may no longer be available.");
+        }
     }
     private void ObserveCurrentParty(PartySnapshot previous, DateTimeOffset now)
     {
@@ -136,8 +161,9 @@ public sealed partial class Plugin
         lookupCancellation?.Cancel(); lookupCancellation?.Dispose(); lookupCancellation = null;
         if (clearCache)
         {
+            nativeInspectionPending = null; Interlocked.Exchange(ref nativeInspectionId, 0);
             memberData.Clear(); collectionQueue.Clear(); CurrentParty = null; selectedListing = lastManual = 0;
-            socialPeople.Clear(); progressRetry = parsesRetry = default; nextPartyRead = nextSocialRead = nextCollection = nextSelectedRequest = default;
+            socialPeople.Clear(); progressRetry = parsesRetry = default; nextPartyRead = nextSocialRead = nextCollection = default;
         }
         if (clearCache && !LookupBusy) lookups.Clear();
         LookupStatus = "Collecting matched parties in the background.";
@@ -162,9 +188,7 @@ public sealed partial class Plugin
             UpdateCompanyRoster(now, roster.FreeCompanyId);
         }
         preview.Tick(now);
-        if (inspectionSweep && (selectedListing == 0 ||
-            (listings.GetValueOrDefault(selectedListing) ?? socialListings.GetValueOrDefault(selectedListing)) is not { } pendingListing ||
-            pendingListing.Expires <= now || Collected(selectedListing) is not null)) FinishInspectionSweep();
+        TickNativeInspection(now);
         foreach (var detail in preview.Parties.Values)
         {
             if (detail.Recruitment is not { } recruitment) continue;
@@ -175,46 +199,39 @@ public sealed partial class Plugin
         }
         CaptureManualDetail(now);
         RefreshCurrentParty(now);
-        if (!collecting && native.FinderReady && !windows.NativeFinderInteracting && preview.CanPrefetch(now) &&
+        if (nativeInspectionPending is null && !collecting && native.FinderReady && !windows.NativeFinderInteracting && preview.CanPrefetch(now) &&
             (!Scanning || scanStage == 1 && now < scanPageDeadline))
         {
-            var visible = native.PageListingIds();
-            var selected = listings.GetValueOrDefault(selectedListing) ?? socialListings.GetValueOrDefault(selectedListing);
-            if (selected is not null && selected.Expires > now && visible.Contains(selected.Id) &&
-                Collected(selected.Id) is null && now >= nextSelectedRequest)
-            {
-                nextSelectedRequest = now.AddSeconds(15);
-                if (preview.Prefetch(selected.Id, now) && Scanning) scanAttemptedDetails.Add(selected.Id);
-            }
-            var profileTargets = Matches.Select(m => m.Listing).Where(l => SweepPolicy.OnPage(l, visible, now) &&
-                (!Scanning || !scanAttemptedDetails.Contains(l.Id))).ToArray();
-            var id = preview.Busy ? 0 : collectionQueue.Next(profileTargets, preview.Parties, now);
-            if (id == 0 && !preview.Busy && Scanning && socialSweepRequested)
-            {
-                var profileIds = profileTargets.Select(l => l.Id).ToHashSet();
-                id = socialCollectionQueue.Next(scanPageListings.Values.Where(l => SweepPolicy.OnPage(l, visible, now) &&
-                    !profileIds.Contains(l.Id) && !scanAttemptedDetails.Contains(l.Id)), preview.Parties, now);
-            }
+            var profileTargets = Matches.Select(m => m.Listing).ToArray();
+            var contactTargets = socialListings.Values.Where(listing => SweepPolicy.ShowContact(listing, now));
+            var id = collectionQueue.NextPrioritized(profileTargets, contactTargets, preview.Parties, now,
+                socialCollectionQueue, ContactActive && !Scanning);
             if (id != 0)
             {
-                if (Scanning) scanAttemptedDetails.Add(id);
-                preview.Prefetch(id, now);
+                if (preview.Prefetch(id, now))
+                {
+                    if (Scanning) scanAttemptedDetails.Add(id);
+                    if (profileTargets.Any(listing => listing.Id == id)) profileDetailRequests++; else contactDetailRequests++;
+                    if (!native.PageListingIds().Contains(id)) offPageDetailRequests++;
+                }
             }
         }
         var manual = NativeParty;
-        var matched = Matches.Select(m => Collected(m.Listing.Id)).OfType<PartyDetail>()
+        var matched = new[] { manual, Active ? CurrentParty : null, windows.WorkspaceOpen ? Inspected : null }.OfType<PartyDetail>()
+            .Concat(Matches.Select(m => Collected(m.Listing.Id)).OfType<PartyDetail>())
             .Concat(Active && socialSweepRequested ? socialListings.Values.Where(l => l.Expires > now && filter.Evaluate(l, l.Seen) is not null).Select(l => Collected(l.Id)).OfType<PartyDetail>() : [])
-            .Concat(new[] { Active ? CurrentParty : null, windows.MainOpen ? Inspected : null, manual }.OfType<PartyDetail>()).DistinctBy(p => p.Id).ToArray();
+            .DistinctBy(p => p.Id).ToArray();
         var resolve = socialSweepRequested && (Settings.CustomFriends.Count > 0 || Settings.WatchFreeCompany && companyRoster.Count > 0)
             ? matched.Concat(socialListings.Values.Where(l => SweepPolicy.ShowContact(l, now)).Select(l => Collected(l.Id)).OfType<PartyDetail>()).DistinctBy(p => p.Id) : matched;
         if (manual is not null) preview.ResolveNext([manual], now, manualDetail: true);
         preview.ResolveNext(resolve, now);
         if (!LookupBusy)
-            foreach (var detail in Inspection.LookupBatches(matched.OrderByDescending(d => d.Id == selectedListing)
+            foreach (var detail in Inspection.LookupBatches(matched.OrderByDescending(d => manual is not null && d.Id == manual.Id)
+                .ThenByDescending(d => d.Id == 0).ThenByDescending(d => d.Id == selectedListing)
                 .ThenBy(d => d.Members.Where(m => m.Resolved).Select(m => DataFor(m, d.Duty)?.ProgressAt ?? DateTimeOffset.MinValue).DefaultIfEmpty().Min())))
                 if (StartLookup(detail, null, now)) break;
         PruneMemberData(now);
-        CloseFinderIfIdle(now);
+        if (nativeInspectionPending is null) CloseFinderIfIdle(now);
     }
     private void PruneMemberData(DateTimeOffset now)
     {

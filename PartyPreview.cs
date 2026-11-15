@@ -30,7 +30,7 @@ internal sealed unsafe class PartyPreview : IDisposable
     private readonly Hook<UIGlobals.Delegates.PlaySoundEffect>? soundHook;
     private readonly Hook<SoundManager.Delegates.PlaySystemSound>? systemSoundHook;
     private long requested, background, plateErrorId, manualId;
-    private DateTimeOffset requestUntil, nextRequest, listingUntil, listingStarted, nextRead, nextListing;
+    private DateTimeOffset requestUntil, nextRequest, listingUntil, listingStarted, nextRead, nextListing, manualUntil;
     private DateTimeOffset listingErrorUntil, plateErrorUntil;
     private bool listingFailure, plateFailure, manualPlate, namesChanged;
     [ThreadStatic] private static int quietSounds, mutedSystemCalls;
@@ -54,7 +54,9 @@ internal sealed unsafe class PartyPreview : IDisposable
     internal int SuppressedSounds => Volatile.Read(ref suppressedSounds);
     internal int PassedThroughSounds => Volatile.Read(ref passedThroughSounds);
     internal int MutedSystemSounds => Volatile.Read(ref mutedSystemSounds);
-    internal bool CanPrefetch(DateTimeOffset now) => !Busy && !DetailOpen && now >= nextListing;
+    internal bool CanPrefetch(DateTimeOffset now) => !Busy && !DetailOpen && (ManualId == 0 || now >= manualUntil) && now >= nextListing;
+    internal void ExpectManual(ulong id, DateTimeOffset now) { ManualId = id; manualUntil = now.AddSeconds(8); }
+    internal void CancelExpectedManual() { ManualId = 0; manualUntil = default; }
 
     internal PartyPreview(IFramework framework, NativePartyFinder native, IGameInteropProvider interop, Func<bool> nativeFinderHovered,
         Func<ulong, bool> switchTarget, Func<ushort, (string Name, string Region)> world)
@@ -226,8 +228,9 @@ internal sealed unsafe class PartyPreview : IDisposable
         nextRead = now.AddMilliseconds(200);
         var visible = native.VisibleDetailId;
         var owned = BackgroundId;
-        if (visible == 0) ManualId = 0;
-        if (visible != 0 && visible != BackgroundId)
+        if (visible != 0 && visible == ManualId) manualUntil = default;
+        if (visible == 0 && now >= manualUntil) ManualId = 0;
+        if (visible != 0 && visible != BackgroundId && (ManualId == 0 || visible == ManualId || now >= manualUntil))
         {
             if (visible != ManualId && (owned != 0 || WasBackgroundListing(visible, now)) && !nativeFinderHovered())
             { native.SuppressBackgroundDetail(); native.HideBackgroundDetail(visible); CloseUnexpectedQuiet(visible); }
@@ -307,7 +310,7 @@ internal sealed unsafe class PartyPreview : IDisposable
     }
     internal bool Prefetch(ulong id, DateTimeOffset now)
     {
-        if (id == 0 || Busy || DetailOpen || now < nextListing || !native.PageListingIds().Contains(id)) return false;
+        if (id == 0 || Busy || DetailOpen || now < nextListing || !native.FinderReady) return false;
         if (recentListings.Count >= 256)
             foreach (var old in recentListings.OrderBy(pair => pair.Value).Take(64)) recentListings.TryRemove(old.Key, out _);
         recentListings[id] = now.AddSeconds(30);
@@ -332,7 +335,7 @@ internal sealed unsafe class PartyPreview : IDisposable
         if (!keepSound && soundHook?.IsEnabled == true) soundHook.Disable();
         if (!keepSound && systemSoundHook?.IsEnabled == true) systemSoundHook.Disable();
     }
-    internal void Stop(bool clearNames = true) { Pause(); ManualId = 0; Parties.Clear(); if (clearNames) names.Clear(); }
+    internal void Stop(bool clearNames = true) { Pause(); CancelExpectedManual(); Parties.Clear(); if (clearNames) names.Clear(); }
     public void Dispose() { Stop(); soundHook?.Dispose(); systemSoundHook?.Dispose(); listingHook?.Dispose(); packetHook?.Dispose(); }
     private bool WasBackgroundListing(ulong id, DateTimeOffset now) =>
         recentListings.TryGetValue(id, out var until) && now <= until;

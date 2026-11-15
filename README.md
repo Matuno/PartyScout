@@ -1,13 +1,8 @@
-<img src="images/icon.png" alt="Party Scout logo" width="128" align="right">
+<img src="images/logo-glyph.png" alt="Party Scout logo" width="128" align="right">
 
 # Party Scout
 
-Find the right party and see who's playing.
-
-- Search Party Finder with job, duty and keyword profiles, and favour preferred jobs.
-- View matching parties, their members and available progress and performance.
-- Find friends, free company members and custom contacts.
-- Get alerts or opt in to automatic party switching.
+Find parties that match your goals, see who's playing, and keep an eye on friends. Get alerts or opt in to automatic party switching.
 
 ## Install
 

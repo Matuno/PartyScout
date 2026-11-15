@@ -145,6 +145,10 @@ public sealed record Match(Listing Listing, int Score, uint[] PlayableJobs)
     public double Rank => UsesJobPreferences ? Listing.Filled + PreferenceBonus : Score;
     public double RankForJob(uint job) => !PlayableJobs.Contains(job) ? double.NegativeInfinity :
         UsesJobPreferences ? Listing.Filled + JobPreferences.GetValueOrDefault(job) : Score;
+    public uint SelectJob(uint currentJob, IEnumerable<uint> gearJobs) => PlayableJobs
+        .Where(job => job == currentJob || gearJobs.Contains(job))
+        .OrderByDescending(RankForJob).ThenByDescending(job => job == currentJob).ThenBy(job => job)
+        .FirstOrDefault();
 }
 
 public sealed class ListingFilter
@@ -232,14 +236,19 @@ public sealed class AlertState
     private readonly Dictionary<ulong, double> announced = [];
     public Match? Target { get; private set; }
     public DateTimeOffset? Deadline { get; private set; }
+    public uint TargetJob { get; private set; }
+    private uint lastCurrentJob;
 
-    public bool Update(IEnumerable<Match> matches, double? baseline, bool enabled, bool timed, int delay, DateTimeOffset now, uint currentJob)
+    public bool Update(IEnumerable<Match> matches, double? baseline, bool enabled, bool timed, int delay, DateTimeOffset now, uint currentJob, IEnumerable<uint>? gearJobs = null)
     {
         var best = enabled && baseline is { } baselineScore ? matches.FirstOrDefault(m => m.Rank > baselineScore && m.Listing.Fresh(now) &&
             (!dismissed.TryGetValue(m.Listing.Id, out var score) || m.Rank > score)) : null;
         var changed = best?.Listing.Id != Target?.Listing.Id;
-        timed = timed && best is not null && best.Listing.Parties == 1 && best.RankForJob(currentJob) > baseline;
-        if (changed) Deadline = best is not null && timed ? now.AddSeconds(delay) : null;
+        var job = best?.SelectJob(currentJob, gearJobs ?? []) ?? 0;
+        timed = timed && best is not null && job != 0 && best.Listing.Parties == 1 && best.RankForJob(job) > baseline;
+        if (changed || job != TargetJob || currentJob != lastCurrentJob) Deadline = best is not null && timed ? now.AddSeconds(delay) : null;
+        TargetJob = job;
+        lastCurrentJob = currentJob;
         if (!timed) Deadline = null;
         if (best is not null && timed && Deadline is null) Deadline = now.AddSeconds(delay);
         Target = best;
@@ -257,7 +266,7 @@ public sealed class AlertState
             if (Target?.Listing.Id == target.Listing.Id) Clear();
         }
     }
-    public void Clear() { Target = null; Deadline = null; }
+    public void Clear() { Target = null; Deadline = null; TargetJob = 0; lastCurrentJob = 0; }
     public void SuppressExisting(IEnumerable<Match> matches)
     {
         foreach (var match in matches)

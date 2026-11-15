@@ -4,6 +4,16 @@ namespace PartyScout.Core;
 internal sealed class CollectionQueue
 {
     private readonly Dictionary<ulong, DateTimeOffset> attempted = [];
+    internal ulong NextPrioritized(IEnumerable<Listing> matches, IEnumerable<Listing> contacts,
+        IReadOnlyDictionary<ulong, PartyDetail> collected, DateTimeOffset now, CollectionQueue contactQueue, bool allowContacts)
+    {
+        var preferred = matches.ToArray();
+        var id = Next(preferred, collected, now);
+        if (id != 0 || !allowContacts) return id;
+        var matchingIds = preferred.Select(listing => listing.Id).ToHashSet();
+        return contactQueue.Next(contacts.Where(listing => !matchingIds.Contains(listing.Id)), collected, now);
+    }
+
     internal ulong Next(IEnumerable<Listing> listings, IReadOnlyDictionary<ulong, PartyDetail> collected, DateTimeOffset now)
     {
         var wanted = listings.Where(l => l.Expires > now).DistinctBy(l => l.Id).ToArray();

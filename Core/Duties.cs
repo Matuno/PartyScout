@@ -10,6 +10,10 @@ internal readonly record struct DutyChoice(uint Id, string Name, bool HighEnd, D
 
 internal static class DutyPicker
 {
+    internal static IOrderedEnumerable<DutyChoice> Order(IEnumerable<DutyChoice> duties) => duties
+        .OrderBy(d => d.Category).ThenBy(d => d.ExpansionId == uint.MaxValue)
+        .ThenByDescending(d => d.ExpansionId).ThenByDescending(d => d.Id);
+
     internal static DutyCategory Category(uint contentType, string uiCategory, bool highEnd) => contentType switch
     {
         28 => DutyCategory.Ultimates,

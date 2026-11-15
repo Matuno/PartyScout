@@ -3,6 +3,7 @@ using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Client.UI.Info;
+using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using PartyScout.Core;
 
@@ -20,6 +21,31 @@ internal sealed record SocialRoster(SocialPerson[] People, bool FreeCompanyVerif
 // All methods run on IFramework; no native pointer survives a call.
 internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, IPlayerState player)
 {
+    internal uint[] GearsetJobs()
+    {
+        var module = RaptureGearsetModule.Instance();
+        if (module == null) return [];
+        var jobs = new HashSet<uint>();
+        for (var i = 0; i < 100; i++)
+        {
+            var gearset = module->GetGearset(i);
+            if (gearset != null && module->IsValidGearset(i) && (gearset->Flags & RaptureGearsetModule.GearsetFlag.Exists) != 0)
+                jobs.Add(gearset->ClassJob);
+        }
+        return jobs.ToArray();
+    }
+    internal bool EquipJob(uint job)
+    {
+        var module = RaptureGearsetModule.Instance();
+        if (module == null) return false;
+        for (var i = 0; i < 100; i++)
+        {
+            var gearset = module->GetGearset(i);
+            if (gearset != null && module->IsValidGearset(i) && (gearset->Flags & RaptureGearsetModule.GearsetFlag.Exists) != 0 && gearset->ClassJob == job)
+                return module->EquipGearset(i) == 0;
+        }
+        return false;
+    }
     private ushort hiddenAddon;
     private ushort quietFinderAddon;
     private bool previousFinderDisableFocus;

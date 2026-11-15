@@ -16,19 +16,61 @@ internal sealed partial class ScoutWindows
     private void Overview()
     {
         if (p.View.Party.InParty && ImGui.Selectable($"Your party · {(p.CurrentScore is { } yourScore ? $"{yourScore:0.#} {p.ScoreUnit}" : "score unavailable")}##baseline")) SelectTab(RibbonTab.Current);
-        if (p.OverviewMatches.Length == 0)
-        {
-            ImGui.TextWrapped(p.Active ? "No matching parties yet." : "Press Watch to start searching.");
-            if (Icon(FontAwesomeIcon.SlidersH, "editProfiles", "Edit search profiles", new Vector2(ImGui.GetFrameHeight()))) SelectTab(RibbonTab.Setup);
-        }
-        else ImGui.TextDisabled("YOUR MATCHES");
+        if (p.FilterError is { } error) ImGui.TextWrapped(error);
+        if (p.OverviewMatches.Length == 0) EmptyMatches();
+        else SectionTitle("Your matches");
+        ImGui.PushID("matches");
         foreach (var match in p.OverviewMatches) ListingCard(match.Listing, match);
+        ImGui.PopID();
         AllListingsDivider();
-        if (!p.BrowseAll) return;
-        var matched = p.OverviewMatches.Select(m => m.Listing.Id).ToHashSet();
-        var other = p.OverviewListings.Where(l => !matched.Contains(l.Id)).ToArray();
-        if (other.Length == 0) ImGui.TextDisabled(p.Scanning ? "Looking for more listings…" : "No other listings for your enabled duties.");
-        foreach (var listing in other) ListingCard(listing, null);
+        if (p.BrowseAll)
+        {
+            var matched = p.OverviewMatches.Select(m => m.Listing.Id).ToHashSet();
+            var other = p.OverviewListings.Where(l => !matched.Contains(l.Id)).ToArray();
+            if (other.Length == 0) ImGui.TextDisabled(p.Scanning ? "Looking for more listings…" : "No other listings for your enabled duties.");
+            ImGui.PushID("other");
+            foreach (var listing in other) ListingCard(listing, null);
+            ImGui.PopID();
+        }
+        FriendsOverview();
+    }
+
+    private void EmptyMatches(bool showSearches = false)
+    {
+        ImGui.TextWrapped(!C.Profiles.Any(profile => profile.Enabled && profile.Jobs.Count > 0)
+            ? "Choose your duties and playable jobs to find a party." : p.Active ? "No matching parties yet." : "Press Watch to start searching.");
+        if (ImGui.Button("Edit searches")) SelectTab(RibbonTab.Setup);
+        if (!showSearches) return;
+        var enabled = C.Profiles.Where(profile => profile.Enabled).ToArray();
+        if (enabled.Length == 0) return;
+        ImGui.Spacing(); SectionTitle("Enabled searches");
+        var summaryIndex = 0;
+        foreach (var profile in enabled.Take(3))
+        {
+            var jobs = profile.Jobs.Count == 0 ? "No jobs" : p.JobNames(p.JobChoices.Where(job => profile.Jobs.Contains(job.Id)).Select(job => job.Id));
+            var duties = profile.Duties.Count == 0 ? "All duties" : profile.Duties.Count == 1 ? p.DutyLabel(profile.Duties.First()) : $"{profile.Duties.Count} duties";
+            ImGui.PushID(summaryIndex++);
+            ImGui.BeginGroup();
+            var start = ImGui.GetCursorScreenPos();
+            ImGui.Indent(8 * Scale);
+            ItemTitle(profile.Name);
+            using (ImRaii.PushStyle(ImGuiStyleVar.CellPadding, new Vector2(0, 1) * Scale))
+            if (ImGui.BeginTable("SearchSummary", 2, ImGuiTableFlags.SizingStretchProp))
+            {
+                ImGui.TableSetupColumn("Field", ImGuiTableColumnFlags.WidthFixed, Math.Max(42 * Scale, ImGui.CalcTextSize("Duty").X + 8 * Scale));
+                ImGui.TableSetupColumn("Value", ImGuiTableColumnFlags.WidthStretch);
+                ImGui.TableNextColumn(); FieldLabel("Duty"); ImGui.TableNextColumn(); OneLine(duties, palette.Text);
+                ImGui.TableNextColumn(); FieldLabel("Jobs"); ImGui.TableNextColumn(); OneLine(jobs, palette.Text);
+                ImGui.EndTable();
+            }
+            ImGui.Unindent(8 * Scale);
+            ImGui.EndGroup();
+            var end = ImGui.GetItemRectMax();
+            ImGui.GetWindowDrawList().AddRectFilled(start, new Vector2(start.X + 2 * Scale, end.Y), ImGui.GetColorU32(palette.Border), 1 * Scale);
+            ImGui.PopID();
+            ImGui.Spacing();
+        }
+        if (enabled.Length > 3) ImGui.TextDisabled("More searches…");
     }
 
     private void AllListingsDivider()
@@ -47,107 +89,95 @@ internal sealed partial class ScoutWindows
         if (ImGui.SmallButton(label + "##allListings")) p.Post(() => p.SetBrowseAll(!p.BrowseAll));
     }
 
-    private void ListingCard(Listing listing, Match? match)
+    private void ListingCard(Listing listing, Match? match, bool compact = false, bool inspectable = true, string? contacts = null)
     {
         var fresh = listing.Fresh(DateTimeOffset.UtcNow);
-        var rows = Math.Max(1, (listing.Total + 7) / 8);
-        var description = listing.Description.Replace('\r', ' ');
-        var wrapWidth = Math.Max(1, ImGui.GetContentRegionAvail().X - 2 * ImGui.GetStyle().WindowPadding.X);
-        var descriptionHeight = description.Length == 0 ? 0 : ImGui.CalcTextSize(description, false, wrapWidth).Y + ImGui.GetStyle().ItemSpacing.Y;
-        var lines = (fresh ? 4 : 5) - (C.Emphasis == ListingEmphasis.Description ? 1 : 0);
-        if (match?.JobPreferences.Count > 0) lines++;
-        var height = lines * ImGui.GetTextLineHeightWithSpacing() + (rows * 25 + 16) * Scale + descriptionHeight;
-        var score = match?.Rank ?? (p.UsesJobPreferences ? listing.Filled : Jobs.Score(listing.JobsPresent.Take(listing.Total), C));
         var yourParty = p.View.Party.InParty && listing.Leader != 0 && listing.Leader == p.View.Party.Leader;
+        var better = match is not null && fresh && p.View.Party.InParty && match.Rank > p.CurrentScore;
+        var detail = p.Collected(listing.Id);
+        var canInspect = inspectable && p.Active && !p.Joining && listing.Expires > DateTimeOffset.UtcNow;
+        var playableJobs = match?.PlayableJobs ?? C.Profiles.Where(profile => profile.Enabled &&
+                (profile.Duties.Count == 0 || profile.Duties.Contains(listing.Duty)))
+            .SelectMany(profile => profile.Jobs).Distinct().Where(listing.Accepts).ToArray();
+        var description = listing.Description.Replace('\r', ' ');
+        var width = Math.Max(1, ImGui.GetContentRegionAvail().X - 28 * Scale);
+        var line = ImGui.GetTextLineHeightWithSpacing();
+        var height = 16 * Scale + line +
+            Math.Max(1, (listing.Total + 7) / 8) * (22 * Scale + ImGui.GetStyle().ItemSpacing.Y);
+        if (description.Length > 0) height += compact ? line : ImGui.CalcTextSize(description, false, width).Y + ImGui.GetStyle().ItemSpacing.Y;
+        if (C.Emphasis == ListingEmphasis.Performance) height += line;
         ImGui.PushID(listing.Id.ToString());
-        var border = yourParty ? Accent :
-            match is not null && fresh && p.View.Party.InParty && score > p.CurrentScore ? palette.Good : palette.Border;
-        border.W = .55f;
-        using var colour = ImRaii.PushColor(ImGuiCol.ChildBg, palette.Panel)
-            .Push(ImGuiCol.Border, border);
-        if (ImGui.BeginChild("Listing", new Vector2(0, height), true, ImGuiWindowFlags.NoScrollbar))
+        var title = (contacts is null ? "" : contacts + " · ") + p.DutyName(listing);
+        if (yourParty) title = "Your party · " + title;
+        else if (better) title = "↑ " + title;
+        bool expanded;
+        using (p.HeadingFont.Push())
+        using (ImRaii.PushColor(ImGuiCol.Header, palette.Panel))
         {
-            var detail = p.Collected(listing.Id);
-            var inspect = false;
-            if (ImGui.BeginTable("Header", 2, ImGuiTableFlags.SizingStretchProp))
+            var flags = ImGuiTreeNodeFlags.OpenOnArrow | (match is not null && contacts is null ? ImGuiTreeNodeFlags.DefaultOpen : ImGuiTreeNodeFlags.None);
+            expanded = ImGui.CollapsingHeader("##party", flags);
+            var min = ImGui.GetItemRectMin(); var max = ImGui.GetItemRectMax();
+            var count = $"{listing.Filled}/{listing.Total}";
+            var countWidth = ImGui.CalcTextSize(count).X;
+            var left = min.X + ImGui.GetFontSize() + 2 * ImGui.GetStyle().FramePadding.X;
+            var right = max.X - ImGui.GetStyle().FramePadding.X;
+            var available = Math.Max(0, right - countWidth - 8 * Scale - left);
+            var display = Fit(title, available);
+            var y = min.Y + (max.Y - min.Y - ImGui.GetTextLineHeight()) / 2;
+            var draw = ImGui.GetWindowDrawList();
+            draw.AddText(new Vector2(left, y), ImGui.GetColorU32(palette.Text), display);
+            draw.AddText(new Vector2(right - countWidth, y), ImGui.GetColorU32(Muted), count);
+            if (ImGui.IsItemHovered())
             {
-                ImGui.TableSetupColumn("Duty", ImGuiTableColumnFlags.WidthStretch);
-                ImGui.TableSetupColumn("Score", ImGuiTableColumnFlags.WidthFixed, 88 * Scale);
-                ImGui.TableNextColumn();
-                inspect = TextLink("inspect", p.DutyName(listing), Accent);
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(p.DutyName(listing) + "\n" + listing.Description);
-                ImGui.TableNextColumn();
-                var delta = match is not null && p.View.Party.InParty && p.CurrentScore is { } current ? score - current : 0;
-                ImGui.TextColored(fresh && delta > 0 ? palette.Good : Muted, $"{score:0.#} {p.ScoreUnit}{(delta > 0 ? $" +{delta:0.#}" : "")}");
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(ScoreTooltip(listing, match));
-                ImGui.EndTable();
+                if (canInspect && ImGui.GetMousePos().X >= left)
+                {
+                    ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
+                    if (ImGui.IsItemClicked()) p.Post(() => p.Inspect(listing));
+                }
+                if (display != title) ImGui.SetTooltip(title);
             }
+        }
+        if (!expanded) { ImGui.PopID(); return; }
+        ImGui.SetCursorPosY(ImGui.GetCursorPosY() - ImGui.GetStyle().ItemSpacing.Y);
+        using var colour = ImRaii.PushColor(ImGuiCol.ChildBg, palette.Panel);
+        using var padding = ImRaii.PushStyle(ImGuiStyleVar.WindowPadding, new Vector2(14, 8) * Scale);
+        var parentFontSize = ImGui.GetFontSize();
+        if (ImGui.BeginChild("Listing", new Vector2(0, height), false,
+            ImGuiWindowFlags.AlwaysUseWindowPadding | ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse))
+        {
+            MatchParentFontSize(parentFontSize);
+            if (yourParty || better)
+            {
+                var pos = ImGui.GetWindowPos();
+                ImGui.GetWindowDrawList().AddRectFilled(pos + new Vector2(0, 8 * Scale), pos + new Vector2(3 * Scale, ImGui.GetWindowSize().Y - 8 * Scale),
+                    ImGui.GetColorU32(yourParty ? Accent : palette.Good), 2 * Scale);
+            }
+            if (description.Length > 0)
+            {
+                if (compact) OneLine(description.Replace('\n', ' '), palette.Text);
+                else ImGui.TextWrapped(description);
+            }
+            SlotStrip(listing, detail, playableJobs);
             if (C.Emphasis == ListingEmphasis.Performance) SummaryLine(detail, listing.Filled);
-            else OneLine((yourParty ? "YOUR PARTY · " : "") +
-                (match is null ? "Outside profile filters" : string.Join(" / ", match.ProfileNames) + " · " + p.JobNames(match.PlayableJobs)), Muted);
-            PreferredJobsLine(match);
-            if (!fresh) OneLine($"Last seen {Math.Max(1, (int)(DateTimeOffset.UtcNow - listing.Seen).TotalSeconds)}s ago · may have changed", Gold);
-            SlotStrip(listing, detail);
-            ImGui.SameLine(); ImGui.TextDisabled($"{listing.Filled}/{listing.Total}");
-            if (detail is not null && StaleSeconds(detail.Collected, DateTimeOffset.UtcNow) is { } rosterAge)
-            {
-                ImGui.SameLine(); ImGui.TextColored(Gold, $"· roster {rosterAge}s");
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip("Roster last checked " + rosterAge + " seconds ago; members may have changed.");
-            }
-            if (C.Emphasis == ListingEmphasis.Performance)
-                OneLine(detail is null ? "Roster unavailable" : string.Join(" · ", detail.Members.Select(m => RosterSummary.Progress(p.DataFor(m, detail.Duty))).Distinct()), Muted);
-            else if (C.Emphasis != ListingEmphasis.Description) SummaryLine(detail, listing.Filled);
             RecruitmentLine(listing with { Languages = detail?.Recruitment?.Languages ?? listing.Languages });
-            if (description.Length > 0) { ImGui.PushTextWrapPos(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X); ImGui.TextWrapped(description); ImGui.PopTextWrapPos(); }
-            if (ImGui.IsWindowHovered())
+            if (canInspect && ImGui.IsWindowHovered())
             {
                 ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
-                inspect |= ImGui.IsMouseClicked(ImGuiMouseButton.Left);
+                if (ImGui.IsMouseClicked(ImGuiMouseButton.Left)) p.Post(() => p.Inspect(listing));
             }
-            if (inspect) p.Post(() => p.Inspect(listing));
         }
         ImGui.EndChild(); ImGui.PopID();
-    }
-
-    private void Party()
-    {
-        if (p.PreviewError is { } error) ImGui.TextWrapped(error);
-        if (p.Inspected is not { } detail)
-        { ImGui.TextWrapped(p.HasInspection ? "Collecting this party’s roster…" : "Inspect a match or contact to see its roster."); return; }
-        OneLine(p.InspectedDuty, Accent);
-        if (StaleSeconds(detail.Collected, DateTimeOffset.UtcNow) is { } rosterAge)
-            OneLine($"Roster last checked {rosterAge}s ago · members may have changed", Gold);
-        if (detail.Recruitment is { } listing)
-        {
-            RecruitmentLine(listing);
-            if (listing.Description.Length > 0) ImGui.TextWrapped(listing.Description);
-            var current = p.Matches.FirstOrDefault(m => m.Listing.Id == listing.Id);
-            using (ImRaii.Disabled(current is null || p.Joining || !p.Active || !current.PlayableJobs.Contains(p.View.CurrentJob) ||
-                current.Listing.Parties != 1 || current.Listing.Leader == p.View.Party.Leader))
-                if (ImGui.SmallButton((p.View.Party.InParty ? "Leave & join" : "Join party") + (p.UsesJobPreferences ? " as " + p.JobNames([p.View.CurrentJob]) : "")) && current is not null) p.Post(() => p.BeginJoin(current));
-            if (p.CurrentScore >= 0)
-            {
-                ImGui.SameLine();
-                var rank = current?.Rank ?? (p.UsesJobPreferences ? listing.Filled : Jobs.Score(listing.JobsPresent, C));
-                ImGui.TextDisabled($"{rank:0.#} {p.ScoreUnit} · yours {p.CurrentScore:0.#}");
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip(ScoreTooltip(listing, current));
-            }
-            PreferredJobsLine(current);
-        }
-        SummaryLine(detail, detail.Recruitment?.Filled ?? detail.Members.Length);
-        DataNotice(); Roster(detail);
-        if (p.ActionMessage is { } message) ImGui.TextWrapped(message);
     }
 
     private void YourParty()
     {
         if (p.CurrentParty is not { } detail)
         { ImGui.TextWrapped(p.View.Party.InParty ? "Waiting for your party roster…" : "You are not in a party."); return; }
-        ImGui.TextColored(Accent, $"YOUR PARTY · {(p.CurrentScore is { } score ? $"{score:0.#} {p.ScoreUnit}" : "SCORE UNAVAILABLE")}");
+        SectionTitle("Your party");
+        ImGui.SameLine(); ImGui.TextDisabled(p.CurrentScore is { } score ? $"{score:0.#} {p.ScoreUnit}" : "score unavailable");
         if (p.UsesJobPreferences && ImGui.IsItemHovered()) ImGui.SetTooltip("Fit compares other members plus preference for the job you are playing. Your own slot is excluded here because listings do not include you yet.");
-        ImGui.SetNextItemWidth(-1);
-        ImGui.SetNextWindowSizeConstraints(new Vector2(360, 0) * Scale, new Vector2(520, 300) * Scale);
-        if (ImGui.BeginCombo("##CurrentDuty", detail.Duty == 0 ? "Select your party’s duty…" : p.DutyLabel(detail.Duty)))
+        FieldLabel("Duty");
+        if (BeginDutyPicker("##CurrentDuty", detail.Duty == 0 ? "Select your party’s duty…" : p.DutyLabel(detail.Duty)))
         {
             ImGui.SetNextItemWidth(-1); ImGui.InputTextWithHint("##CurrentDutySearch", "Search duties…", ref currentDutySearch, 150);
             HashSet<uint> selected = detail.Duty == 0 ? [] : [detail.Duty];
@@ -155,7 +185,8 @@ internal sealed partial class ScoutWindows
             ImGui.EndCombo();
         }
         if (detail.Recruitment is { } listing) RecruitmentLine(listing);
-        if (detail.Description.Length > 0) ImGui.TextWrapped(detail.Description);
+        if (detail.Description.Length > 0) { FieldLabel("Party description"); ImGui.TextWrapped(detail.Description); }
+        ImGui.Spacing(); SectionTitle("Members");
         SummaryLine(detail, detail.Members.Length);
         DataNotice(); Roster(detail);
     }
@@ -173,7 +204,7 @@ internal sealed partial class ScoutWindows
     {
         if (!p.HasTomestone || !p.HasFFLogs)
         {
-            if (ImGui.SmallButton("Connect player data")) SettingsOpen = true;
+            if (ImGui.SmallButton("Connect player data")) ShowSettings(2);
             if (ImGui.IsItemHovered()) ImGui.SetTooltip($"{(!p.HasTomestone ? "Tomestone key missing. " : "")}{(!p.HasFFLogs ? "FFLogs credentials missing." : "")}");
         }
         if (C.Debug) ImGui.TextWrapped(p.LookupStatus);
@@ -185,62 +216,42 @@ internal sealed partial class ScoutWindows
         var current = detail.Id == 0;
         var total = Inspection.RosterSlots(detail);
         var roster = Inspection.DisplayRoster(detail.Members, total);
-        var columns = ImGui.GetContentRegionAvail().X >= 440 * Scale ? 4 : 2;
-        if (!ImGui.BeginTable("Roster", columns, ImGuiTableFlags.SizingStretchSame)) return;
+        if (!ImGui.BeginTable("Roster", 4, ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.RowBg)) return;
+        ImGui.TableSetupColumn("Job", ImGuiTableColumnFlags.WidthFixed, 26 * Scale);
+        ImGui.TableSetupColumn("Player", ImGuiTableColumnFlags.WidthStretch, 1.3f);
+        ImGui.TableSetupColumn("Avg", ImGuiTableColumnFlags.WidthFixed, 60 * Scale);
+        ImGui.TableSetupColumn("Progress", ImGuiTableColumnFlags.WidthStretch, 1);
+        ImGui.TableHeadersRow();
         for (var slot = 0; slot < roster.Length; slot++)
         {
-            ImGui.TableNextColumn(); ImGui.PushID(slot);
+            ImGui.PushID(slot); ImGui.TableNextRow(); ImGui.TableSetColumnIndex(0);
             var unknownSlot = slot >= total;
             var member = roster[slot];
             var job = member?.Job ?? (!unknownSlot && !current && listing is not null ? listing.JobsPresent.ElementAtOrDefault(slot) : (byte)0);
             var mask = !unknownSlot && !current && listing is not null ? listing.Slots.ElementAtOrDefault(slot) : 0;
             var occupied = member is not null || job > 0;
             var data = member is null ? null : p.DataFor(member, detail.Duty);
-            var parts = data?.ParseError is null ? data?.Parses : null;
-            var zone = data?.Parses?.FirstOrDefault();
-            var zoneInfo = zone?.LatestZoneAverage is { } zoneAverage
-                ? $"\nLatest FFLogs zone {(zone.LatestZoneMedian ? "median" : "best")} average: {zoneAverage:0.0}"
-                : zone?.LatestZoneFailed == true ? "\nLatest FFLogs zone average unavailable; retrying later." : "";
-            var rows = parts is { Length: > 1 } ? 5 : 4;
-            using var card = ImRaii.PushColor(ImGuiCol.ChildBg, palette.Panel);
-            if (ImGui.BeginChild("Member", new Vector2(0, 26 * Scale + (rows - 1) * ImGui.GetTextLineHeightWithSpacing() + 2 * ImGui.GetStyle().WindowPadding.Y), true, ImGuiWindowFlags.NoScrollbar))
+            Slot(job, mask, occupied, unknownSlot ? "Member's slot is unavailable" : occupied ? "Listed job: " + (job > 0 ? p.JobNames([job]) : "Unknown") : OpenJobs(mask));
+            ImGui.TableSetColumnIndex(1);
+            var relation = member is null ? SocialKind.None : p.Relation(member);
+            OneLine((relation != SocialKind.None ? "* " : "") + (member is null ? occupied ? "Identity pending" : "Open slot" : member.Resolved ? member.Name : member.State == NameState.Pending ? "Resolving…" : "Unavailable"),
+                relation != SocialKind.None ? Accent : occupied ? palette.Text : Muted);
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip(member is { Resolved: true } ? $"{member.Name} @ {member.World}\n{(relation != SocialKind.None ? relation : "")}" : occupied ? "The game has not resolved this member’s identity." : OpenJobs(mask));
+            ImGui.TableSetColumnIndex(2);
+            var average = RosterSummary.PlayerAverage(data);
+            var value = data?.ParseError is null && data?.Parses is [{ Failed: false } part] ? part.Average : null;
+            OneLine(occupied ? average : "—", value is { } number ? ParseColor(number) : Muted);
+            if (occupied && ImGui.IsItemHovered())
             {
-                Slot(job, mask, occupied, unknownSlot ? "Party member's slot is unavailable" : occupied ? "Listed job: " + (job > 0 ? p.JobNames([job]) : "Unknown") : OpenJobs(mask));
-                ImGui.SameLine(); ImGui.TextUnformatted(unknownSlot ? "Slot unknown" + (job > 0 ? " · " + p.JobNames([job]) : "") : occupied ? job > 0 ? p.JobNames([job]) : "?" : "Open");
-                if (member is not null)
-                {
-                    var relation = p.Relation(member);
-                    OneLine((relation != SocialKind.None ? "* " : "") + (member.Resolved ? member.Name : member.State == NameState.Pending ? "Resolving…" : "Unavailable"), palette.Text);
-                    if (ImGui.IsItemHovered()) ImGui.SetTooltip(member.Resolved ? $"{member.Name} @ {member.World}\n{(relation != SocialKind.None ? relation : "")}" : "The game has not resolved this member’s identity.");
-                    if (parts is { Length: > 0 })
-                        for (var phase = 0; phase < parts.Length; phase++)
-                        {
-                            var parse = parts[phase];
-                            var zoneOnly = parts.Length == 1 && parse.Average is null && parse.LatestZoneAverage.HasValue;
-                            var shown = parse.Failed ? null : zoneOnly ? parse.LatestZoneAverage : parse.Average;
-                            OneLine($"{(zoneOnly ? "Zone " : parts.Length > 1 ? $"P{phase + 1} " : "Avg ")}{shown?.ToString("0.0") ?? "—"}", shown is { } value ? ParseColor(value) : Muted);
-                            if (ImGui.IsItemHovered()) ImGui.SetTooltip($"Mean of {parse.Samples} returned public percentiles for this duty and listed job.\nListed job best: {parse.JobBest?.ToString("0.0") ?? "—"} · Any job best: {parse.AnyBest?.ToString("0.0") ?? "—"} {parse.BestJob}\nClears: {parse.Kills?.ToString() ?? "unknown"}{zoneInfo}\n{parse.Status}\nChecked {data!.ParsesAt:HH:mm} UTC");
-                        }
-                    else
-                    {
-                        ImGui.TextDisabled("Avg —");
-                        if (ImGui.IsItemHovered()) ImGui.SetTooltip((data?.ParseError ?? (p.HasFFLogs ? "Public parse data pending or unavailable." : "Configure FFLogs in Settings.")) + zoneInfo);
-                    }
-                    OneLine(RosterSummary.Progress(data), RosterSummary.FullClear(data) ? palette.Good : Muted);
-                    if (ImGui.IsItemHovered()) ImGui.SetTooltip($"{RosterSummary.Progress(data)}\n{data?.Progress?.DisplayPercent}\nTomestone clears: {data?.Progress?.TotalClears?.ToString() ?? "unknown"} · {data?.Progress?.CompletionWeek}\n{data?.ProgressError ?? (data?.Progress is null ? "Public progression pending or unavailable." : data.Progress.LookupFailed ? "Some Tomestone data is unavailable; retrying." : $"Tomestone checked {data.ProgressAt:HH:mm} UTC")}\nFFLogs best pull uses up to 10 recent public reports.");
-                }
-                else
-                {
-                    if (occupied)
-                    {
-                        OneLine("Identity pending", Muted);
-                        ImGui.TextDisabled("Avg —");
-                        ImGui.TextDisabled("—");
-                    }
-                    else if (!current) OneLine(OpenJobs(mask), Muted);
-                }
+                var parts = data?.Parses ?? [];
+                var explanation = string.Join("\n", parts.Select((part, phase) =>
+                    $"{(parts.Length > 1 ? $"P{phase + 1} · " : "")}Mean: {part.Average?.ToString("0.0") ?? "—"} ({part.Samples} public percentiles)\nListed job best: {part.JobBest?.ToString("0.0") ?? "—"} · Any job best: {part.AnyBest?.ToString("0.0") ?? "—"} {part.BestJob}\nClears: {part.Kills?.ToString() ?? "unknown"} · {part.Status}\nLatest zone average: {part.LatestZoneAverage?.ToString("0.0") ?? "—"}"));
+                ImGui.SetTooltip(average + "\n" + (data?.ParseError ?? (parts.Length == 0 ? p.HasFFLogs ? "Public parse data pending or unavailable." : "Configure FFLogs in Settings." : explanation)) + "\nZ indicates the latest public FFLogs zone average.");
             }
-            ImGui.EndChild(); ImGui.PopID();
+            ImGui.TableSetColumnIndex(3);
+            OneLine(occupied ? RosterSummary.Progress(data) : "—", RosterSummary.FullClear(data) ? palette.Good : Muted);
+            if (occupied && ImGui.IsItemHovered()) ImGui.SetTooltip($"{RosterSummary.Progress(data)}\n{data?.Progress?.DisplayPercent}\nTomestone clears: {data?.Progress?.TotalClears?.ToString() ?? "unknown"} · {data?.Progress?.CompletionWeek}\n{data?.ProgressError ?? (data?.Progress is null ? "Public progression pending or unavailable." : $"Checked {data.ProgressAt:HH:mm} UTC")}\nFFLogs best pull uses up to 10 recent public reports.");
+            ImGui.PopID();
         }
         ImGui.EndTable();
     }
@@ -276,8 +287,7 @@ internal sealed partial class ScoutWindows
         ImGui.GetWindowDrawList().AddText(position, ImGui.GetColorU32(color), Fit(text, width));
         return clicked;
     }
-
-    private void SlotStrip(Listing listing, PartyDetail? detail)
+    private void SlotStrip(Listing listing, PartyDetail? detail, IReadOnlyCollection<uint>? playableJobs = null)
     {
         for (var i = 0; i < Math.Min(48, listing.Total); i++)
         {
@@ -285,11 +295,15 @@ internal sealed partial class ScoutWindows
             var member = detail?.Members.FirstOrDefault(m => m.Slot == i);
             var job = member?.Job ?? (i < listing.JobsPresent.Length ? listing.JobsPresent[i] : (byte)0);
             var mask = i < listing.Slots.Length ? listing.Slots[i] : 0;
-            Slot(job, mask, member is not null || job > 0, member is { Resolved: true } ? member.Name + " · " + member.World :
-                job > 0 ? p.JobNames([job]) : member is not null ? "Occupied · job unavailable" : "Open: " + p.JobNames(Jobs.Rows.Where(j => (mask & Jobs.Mask(j)) != 0).Select(j => (uint)j)));
+            var occupied = member is not null || job > 0;
+            var playable = playableJobs is not null && SlotRoles.CanPlay(mask, occupied, playableJobs);
+            var tooltip = member is { Resolved: true } ? member.Name + " · " + member.World :
+                job > 0 ? p.JobNames([job]) : member is not null ? "Occupied · job unavailable" : "Open: " + p.JobNames(Jobs.Rows.Where(j => (mask & Jobs.Mask(j)) != 0).Select(j => (uint)j));
+            if (playable) tooltip += "\nYour jobs: " + p.JobNames(playableJobs!.Where(j => (mask & Jobs.Mask(j)) != 0));
+            Slot(job, mask, occupied, tooltip, playable);
         }
     }
-    private void Slot(byte job, ulong mask, bool occupied, string tooltip)
+    private void Slot(byte job, ulong mask, bool occupied, string tooltip, bool playable = false)
     {
         var colors = occupied ? SlotRoles.Colors(Jobs.Mask(job)) : SlotRoles.Colors(mask);
         var size = 22 * Scale; var pos = ImGui.GetCursorScreenPos(); var draw = ImGui.GetWindowDrawList();
@@ -299,6 +313,14 @@ internal sealed partial class ScoutWindows
             draw.AddRectFilled(pos + new Vector2(size * stripe / colors.Length, 0), pos + new Vector2(size * (stripe + 1) / colors.Length, size), ImGui.GetColorU32(RoleColors[colors[stripe]]));
         if (occupied && job > 0 && p.Textures.GetFromGameIcon(new GameIconLookup((uint)(62100 + job))).GetWrapOrDefault() is { } texture)
             draw.AddImage(texture.Handle, pos + new Vector2(1 * Scale), pos + new Vector2(size - 1 * Scale));
+        if (playable)
+        {
+            using var font = ImRaii.PushFont(UiBuilder.IconFont);
+            var star = FontAwesomeIcon.Star.ToIconString();
+            var starPos = pos + (new Vector2(size) - ImGui.CalcTextSize(star)) / 2;
+            draw.AddText(starPos + new Vector2(1 * Scale), ImGui.GetColorU32(new Vector4(0, 0, 0, .8f)), star);
+            draw.AddText(starPos, ImGui.GetColorU32(Vector4.One), star);
+        }
         draw.AddRect(pos, pos + new Vector2(size), ImGui.GetColorU32(new Vector4(1, 1, 1, .22f)), 3 * Scale);
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(tooltip);
     }
@@ -332,7 +354,7 @@ internal sealed partial class ScoutWindows
     { using (ImRaii.PushFont(UiBuilder.IconFont)) ImGui.TextColored(color, icon.ToIconString()); }
     private void Badge(FontAwesomeIcon icon, string text, string tooltip)
     {
-        Symbol(icon, Muted); ImGui.SameLine(0, 3); ImGui.TextUnformatted(text);
+        Symbol(icon, Muted); ImGui.SameLine(0, 3 * Scale); ImGui.TextDisabled(text);
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(tooltip);
     }
     private Vector4 ParseColor(double value) => value switch
@@ -352,39 +374,37 @@ internal sealed partial class ScoutWindows
         {
             var match = entry.Match;
             ImGui.PushID(match.Listing.Id.ToString());
-            OneLine(p.DutyName(match.Listing), entry.Read ? palette.Text : Accent);
-            ImGui.TextDisabled($"{entry.At.ToLocalTime():HH:mm} · {Plugin.MatchScoreLabel(match)}");
-            OneLine(string.Join(" / ", match.ProfileNames), Muted);
-            OneLine(match.Listing.Description, palette.Text);
             var fresh = p.Matches.FirstOrDefault(m => m.Listing.Id == match.Listing.Id && m.Listing.Fresh(DateTimeOffset.UtcNow));
-            using (ImRaii.Disabled(fresh is null || !p.Active || p.Joining))
-                if (Icon(FontAwesomeIcon.Eye, "review", "Review party", new Vector2(ImGui.GetFrameHeight())) && fresh is not null) p.Post(() => p.Inspect(fresh.Listing));
-            ImGui.SameLine(); if (Icon(FontAwesomeIcon.Times, "dismiss", "Dismiss alert", new Vector2(ImGui.GetFrameHeight()))) p.Post(() => p.DismissInbox(match));
-            if (fresh is null) { ImGui.SameLine(); ImGui.TextDisabled("No current match"); }
-            ImGui.Separator(); ImGui.PopID();
+            ImGui.AlignTextToFramePadding();
+            ImGui.TextDisabled($"{entry.At.ToLocalTime():HH:mm}" + (fresh is null ? " · No current match" : " · Click party to inspect"));
+            ImGui.SameLine(ImGui.GetContentRegionAvail().X + ImGui.GetCursorPosX() - ImGui.GetFrameHeight());
+            if (Icon(FontAwesomeIcon.Times, "dismiss", "Dismiss alert", new Vector2(ImGui.GetFrameHeight()))) p.Post(() => p.DismissInbox(match));
+            ListingCard(fresh?.Listing ?? match.Listing, fresh ?? match, inspectable: fresh is not null && p.Active && !p.Joining);
+            ImGui.PopID();
         }
     }
 
-    private string ScoreTooltip(Listing listing, Match? match) =>
-        (p.UsesJobPreferences ? $"Fill {listing.Filled} + preferred opening {match?.PreferenceBonus ?? 0:0.#}. Role points break ties.\nYour party excludes your own slot for comparison; it uses the job you are actually playing.\n" : "Filled-role weight.\n") +
-        (p.View.Party.InParty ? p.CurrentScore is { } baseline ? $"Your party: {baseline:0.#} {p.ScoreUnit}." : "Your party's score is unavailable." : "No current party.");
-
-    private void PreferredJobsLine(Match? match)
+    private void FriendsOverview(bool compact = false)
     {
-        if (match is null || match.JobPreferences.Count == 0) return;
-        Symbol(FontAwesomeIcon.Star, Gold); ImGui.SameLine(); OneLine(p.JobNames(match.PreferredJobs), Gold);
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Preferred openings. The best available preference counts once; change jobs before joining if needed.");
+        ImGui.Spacing(); SectionTitle("Friends & contacts");
+        var parties = p.SocialHits.GroupBy(h => h.Listing.Id).ToArray();
+        if (parties.Length == 0) ImGui.TextDisabled(p.ContactActive ? "No contact parties found yet." : "Contact scan paused.");
+        ImGui.PushID("friends");
+        foreach (var party in compact ? parties.Take(2) : parties)
+        {
+            var hits = party.ToArray();
+            var names = string.Join(", ", hits.Select(h => h.Member.Name).Distinct());
+            ListingCard(hits[0].Listing, null, compact, contacts: names);
+        }
+        ImGui.PopID();
     }
 
-    private void People()
+    private void ContactSources()
     {
         if (ImGui.Checkbox("Friends", ref C.WatchFriends)) p.Post(p.Save);
         ImGui.SameLine(); if (ImGui.Checkbox("FC", ref C.WatchFreeCompany)) p.Post(p.Save);
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Find FC members using the public Lodestone roster, including while visiting another data center.");
-        ImGui.SameLine(); using (ImRaii.Disabled(p.Joining))
-            if (Toggle(p.ContactActive ? FontAwesomeIcon.Stop : FontAwesomeIcon.Play, "Sweep", p.ContactActive, "Scan Party Finder for contacts while this window is open."))
-                p.Post(p.ContactActive ? p.StopScan : p.StartScan);
-        if (ImGui.CollapsingHeader("Sources & scan details"))
+        if (SectionDisclosure("Sources & scan details"))
         {
             ImGui.TextWrapped(p.ScanStatus);
             if (!p.QuietBackgroundAvailable) ImGui.TextWrapped("Some background sounds or errors cannot be muted on this game build.");
@@ -392,19 +412,7 @@ internal sealed partial class ScoutWindows
             ImGui.TextWrapped(p.SocialRosterStatus);
             using (ImRaii.Disabled(!p.ContactActive)) if (Icon(FontAwesomeIcon.Sync, "refreshRosters", "Refresh friend and FC rosters", new Vector2(ImGui.GetFrameHeight()))) p.Post(p.RefreshSocialRosters);
         }
-        var parties = p.SocialHits.GroupBy(h => h.Listing.Id).ToArray();
-        if (parties.Length == 0) ImGui.TextWrapped(p.ContactActive ? "No contact parties found yet." : "Contact scan paused.");
-        foreach (var party in parties)
-        {
-            var hits = party.ToArray(); var listing = hits[0].Listing;
-            ImGui.PushID(listing.Id.ToString());
-            var age = StaleSeconds(hits.Min(h => h.Seen), DateTimeOffset.UtcNow) is { } seconds ? $" · seen {seconds}s ago" : "";
-            OneLine(string.Join(", ", hits.Select(h => $"{h.Member.Name} ({h.Kind})").Distinct()) + age, Accent);
-            if (TextLink("social", p.DutyName(listing), palette.Text)) p.Post(() => p.Inspect(listing));
-            SlotStrip(listing, p.Collected(listing.Id)); RecruitmentLine(listing);
-            ImGui.Separator(); ImGui.PopID();
-        }
-        if (ImGui.CollapsingHeader($"Custom contacts · {C.CustomFriends.Count}"))
+        if (SectionDisclosure($"Custom contacts · {C.CustomFriends.Count}"))
         {
             ImGui.SetNextItemWidth(-1); ImGui.InputTextWithHint("##CustomName", "Character name", ref customName, 64);
             ImGui.SetNextItemWidth(-1);

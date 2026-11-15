@@ -9,7 +9,7 @@ public sealed partial class Plugin
     private readonly HashSet<ulong> scanAttemptedDetails = [];
     private readonly CollectionQueue socialCollectionQueue = new();
     private readonly HashSet<string> scannedPages = [];
-    private bool socialSweepRequested, scanPageNeedsSnapshot, inspectionSweep, ownsFinder, profileRefreshPending, batchEnded;
+    private bool socialSweepRequested, scanPageNeedsSnapshot, ownsFinder, profileRefreshPending, batchEnded;
     private volatile bool openingFinder;
     private int scanStage, completedSweeps, lastSweepPages;
     private string previousPage = "";
@@ -21,7 +21,7 @@ public sealed partial class Plugin
     private SocialHit[] cachedSocialHits = [];
     internal bool Scanning { get; private set; }
     internal bool BrowseAll { get; private set; }
-    private bool WantsSweep => ContactActive || BrowseAll || inspectionSweep;
+    private bool WantsSweep => ContactActive || BrowseAll;
     private bool CanStartSweep(DateTimeOffset now) => WantsSweep && !Scanning && !Joining && !profileRefreshPending &&
         !preview.DetailOpen && !windows.NativeFinderInteracting && !native.AdventurerPlateOpen() && now >= nextSweepRestart;
     internal string ScanStatus { get; private set; } = "Contact scanning is paused.";
@@ -87,7 +87,7 @@ public sealed partial class Plugin
             if (Scanning && scanPageNeedsSnapshot && visible.Contains(listing.Id)) scanPageListings[listing.Id] = listing;
         }
         batch.Clear(); collecting = false; LastRefresh = now;
-        if (Scanning && scanPageNeedsSnapshot) nextScanStep = now;
+        if (Scanning && scanPageNeedsSnapshot) nextScanStep = now.AddSeconds(1);
         return true;
     }
     internal SocialHit[] SocialHits
@@ -124,10 +124,9 @@ public sealed partial class Plugin
 
     internal void StartScan()
     {
-        if (!windows.ContactsOpen || Joining || !SafeToMonitor()) { ScanStatus = "Available when logged in, outside duties and combat."; return; }
-        var wasRunning = Running;
+        if (!Active || Joining || !SafeToMonitor()) { ScanStatus = "Start Watch to scan contacts outside duties and combat."; return; }
+        if (contactActive) return;
         contactActive = true;
-        if (!wasRunning) StartEngine();
         preview.Quiet(() => { native.RefreshSocial(); return true; }); nextSocialRead = default;
         if (Scanning) socialSweepRequested = true; else StartSweep();
     }
@@ -137,16 +136,6 @@ public sealed partial class Plugin
         if (!Active || Joining) return;
         if (enabled && !Scanning) StartSweep();
         else if (!enabled && !WantsSweep && Scanning) PauseScan("Listing sweep paused.");
-    }
-    internal void RequestInspectionSweep()
-    {
-        inspectionSweep = true;
-        if (Running && !Joining && !Scanning) StartSweep();
-    }
-    internal void FinishInspectionSweep()
-    {
-        inspectionSweep = false;
-        if (!WantsSweep && Scanning) PauseScan("Listing sweep finished.");
     }
     private void StartSweep()
     {
@@ -163,7 +152,7 @@ public sealed partial class Plugin
     internal void StopScan()
     {
         contactActive = false; CancelCompanyLookup();
-        if ((BrowseAll || inspectionSweep) && Scanning) { socialSweepRequested = false; ScanStatus = "Contact scanning paused; listing sweep continues."; }
+        if (BrowseAll && Scanning) { socialSweepRequested = false; ScanStatus = "Contact scanning paused; listing sweep continues."; }
         else PauseScan("Contact scanning paused.");
         if (!Active) Stop("Contact scanning stopped.");
     }
@@ -176,12 +165,7 @@ public sealed partial class Plugin
     internal void RefreshSocialRosters() { if (ContactActive) { preview.Quiet(() => { native.RefreshSocial(); return true; }); nextSocialRead = default; RefreshCompanyRoster(); } }
     private bool PageCollectionPending(DateTimeOffset now)
     {
-        var visible = native.PageListingIds();
-        var profiles = Matches.Select(m => m.Listing.Id).ToHashSet();
-        return scanPageListings.Values.Where(l => SweepPolicy.OnPage(l, visible, now) && !scanAttemptedDetails.Contains(l.Id))
-            .Any(l => (profiles.Contains(l.Id) ? collectionQueue.CanRequest(l, preview.Parties, now) :
-                socialSweepRequested && socialCollectionQueue.CanRequest(l, preview.Parties, now)) ||
-                l.Id == selectedListing && now >= nextSelectedRequest && !CollectionQueue.IsFresh(l, preview.Parties.GetValueOrDefault(l.Id), now));
+        return Matches.Any(match => collectionQueue.CanRequest(match.Listing, preview.Parties, now));
     }
     private void TickScan(DateTimeOffset now)
     {

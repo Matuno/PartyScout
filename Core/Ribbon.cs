@@ -9,10 +9,10 @@ public enum ListingEmphasis { Composition, Performance, Description }
 internal static class FinderVisibility
 {
     internal static bool HideFinder(bool active, bool show) => active && !show;
-    internal static bool HideDetail(bool active, bool show, bool background, bool joining) =>
-        active && (!show || background || joining);
-    internal static bool ShowDetailOverlay(bool active, bool show, bool joining, bool background, ulong visible, ulong manual) =>
-        visible != 0 && visible == manual && (!active || show) && !joining && !background;
+    internal static bool HideDetail(bool active, bool show, bool background, bool joining, bool selected = false) =>
+        active && (!(show || selected) || background || joining);
+    internal static bool ShowDetailOverlay(bool active, bool show, bool joining, bool background, ulong visible, ulong manual, bool selected = false) =>
+        visible != 0 && visible == manual && (!active || show || selected) && !joining && !background;
 }
 
 internal sealed record RibbonPalette(Vector4 Background, Vector4 Panel, Vector4 Control, Vector4 Hover, Vector4 Border,
