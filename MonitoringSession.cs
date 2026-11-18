@@ -8,9 +8,9 @@ public sealed partial class Plugin
         FinishJoin(true);
         Active = Automation = contactActive = false;
         CancelCompanyLookup();
-        Alert.Reset(); Inbox.Clear(); DismissToast(); BrowseAll = profileRefreshPending = false;
+        Alert.Reset(); Banners.Reset(); BrowseAll = profileRefreshPending = false;
         Matches = []; OverviewMatches = []; OverviewListings = []; CurrentListing = null;
-        CancelLookups(clearCache: !Running);
+        CancelLookups(clearCache: true, keepPartyData: true);
         collecting = false;
         pf.ReceiveListing -= Receive;
         preview.Quiet(() =>
@@ -21,7 +21,7 @@ public sealed partial class Plugin
             preview.Stop(); native.RestoreHiddenInputs(); return true;
         });
         ownsFinder = openingFinder = profileRefreshPending = passivePreview = false;
-        ClearCompanyRoster(); Scanning = socialSweepRequested = BrowseAll = false; socialListings.Clear(); ResetSocialHits(); scanPageListings.Clear(); scanAttemptedDetails.Clear(); socialCollectionQueue.Clear(); scannedPages.Clear();
+        ClearCompanyRoster(); Scanning = BrowseAll = false; socialListings.Clear(); ResetSocialHits(); scanPageListingCount = 0; scanAttemptedDetails.Clear(); socialCollectionQueue.Clear(); scannedPages.Clear();
         Status = reason;
         listings.Clear(); batch.Clear();
         while (incoming.TryDequeue(out _)) { }

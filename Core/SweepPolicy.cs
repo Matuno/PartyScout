@@ -7,9 +7,6 @@ internal static class SweepPolicy
     internal static HashSet<ulong> PageListingIds(ReadOnlySpan<ulong> ids, int count) =>
         ids[..Math.Clamp(count, 0, ids.Length)].ToArray().Where(id => id != 0).ToHashSet();
 
-    internal static bool OnPage(Listing listing, IReadOnlySet<ulong> visible, DateTimeOffset now) =>
-        visible.Contains(listing.Id) && listing.Fresh(now);
-
     internal static bool ShowContact(Listing listing, DateTimeOffset now) =>
         listing.Expires > now && now - listing.Seen < TimeSpan.FromMinutes(2);
 

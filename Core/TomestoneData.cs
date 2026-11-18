@@ -70,7 +70,7 @@ internal static partial class TomestoneData
     internal static (TomestoneEncounterParams? Preferred, TomestoneEncounterParams? Fallback) Encounter(string duty)
         => MultiPartEncounters.TryGetValue(duty, out var parts) ? parts : (Encounters.GetValueOrDefault(duty), null);
 
-    internal static bool HasData(TomestoneCharacterInfo info) => info.Cleared || info.ProgPoint != null || info.TotalClears.HasValue;
+    internal static bool HasData(TomestoneCharacterInfo info) => info.Cleared || !string.IsNullOrWhiteSpace(info.ProgPoint) || info.TotalClears > 0 || info.BestPercent.HasValue;
 
     // The furthest mechanic reached, from a graph of { duration, mechanic: { name, number } } points.
     internal static string? ParseProgPointFromGraph(JsonElement root)
@@ -85,16 +85,14 @@ internal static partial class TomestoneData
         string? mechanic = null;
         foreach (var point in graph.EnumerateArray())
         {
-            if (point.GetNumberOrNull("duration") is not { } duration || duration <= longest)
+            if (point.GetNumberOrNull("duration") is not { } duration || duration <= longest ||
+                !point.TryGetPath(out var mechanicEl, "mechanic") || FormatMechanic(mechanicEl) is not { } known)
             {
                 continue;
             }
 
             longest = duration;
-            if (point.TryGetPath(out var mechanicEl, "mechanic"))
-            {
-                mechanic = FormatMechanic(mechanicEl) ?? mechanic;
-            }
+            mechanic = known;
         }
 
         return mechanic;
@@ -145,7 +143,7 @@ internal static partial class TomestoneData
             if (clears is >= 0 and <= int.MaxValue) info.TotalClears = (int)clears;
         }
 
-        if (root.GetNumberOrNull("bestPercent") is { } bestPercent)
+        if (root.TryGetPath(out var percent, "bestPercent") && ReadPercent(percent) is { } bestPercent)
         {
             info.BestPercent = bestPercent;
         }
@@ -187,13 +185,14 @@ internal static partial class TomestoneData
     // A number, or a string such as "57%".
     internal static double? ReadPercent(JsonElement element)
     {
-        return element.ValueKind switch
+        double? percent = element.ValueKind switch
         {
-            JsonValueKind.Number => element.GetDouble(),
+            JsonValueKind.Number when element.TryGetDouble(out var number) => number,
             JsonValueKind.String when double.TryParse(element.GetString()?.TrimEnd('%'),
                 NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) => parsed,
             _ => null,
         };
+        return percent is >= 0 and <= 100 ? percent : null;
     }
 
     // Savage and ultimate categories group their encounters; the others list them flat.

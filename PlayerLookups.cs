@@ -21,7 +21,7 @@ internal sealed class PlayerLookups : IDisposable
     {
         http = new HttpClient(handler ?? new HttpClientHandler { AllowAutoRedirect = false })
             { Timeout = TimeSpan.FromSeconds(20), MaxResponseContentBufferSize = 2 * 1024 * 1024 };
-        http.DefaultRequestHeaders.UserAgent.ParseAdd("PartyScout/0.1.4");
+        http.DefaultRequestHeaders.UserAgent.ParseAdd("PartyScout/" + typeof(PlayerLookups).Assembly.GetName().Version);
     }
     public void Dispose() => http.Dispose();
     internal void Clear() { lock (progressCache) progressCache.Clear(); parseCache.Clear(); token = null; tokenCredentials = null; }
@@ -105,6 +105,7 @@ internal sealed class PlayerLookups : IDisposable
         lock (progressCache)
             if (progressCache.TryGetValue(key, out var cached) && cached.Until > DateTimeOffset.UtcNow) return cached.Data;
         var info = new TomestoneCharacterInfo();
+        TomestoneCharacterInfo? fallbackInfo = null;
         var (encounter, fallback) = TomestoneData.Encounter(duty);
         var character = Uri.EscapeDataString(member.World) + "/" + Uri.EscapeDataString(member.Name);
         async Task Fetch(string endpoint, Action<JsonElement> parse, bool profile = false)
@@ -136,8 +137,8 @@ internal sealed class PlayerLookups : IDisposable
                 if (TomestoneData.HasData(info)) info.Phase = "P2";
                 else
                 {
-                    TomestoneData.ParseProfileEncounters(info, root, duty, fallback);
-                    if (TomestoneData.HasData(info)) info.Phase = "P1";
+                    fallbackInfo = new();
+                    TomestoneData.ParseProfileEncounters(fallbackInfo, root, duty, fallback);
                 }
             }
         }, profile: true).ConfigureAwait(false);
@@ -145,9 +146,18 @@ internal sealed class PlayerLookups : IDisposable
             foreach (var part in new[] { encounter, fallback })
             {
                 if (part is null || TomestoneData.HasData(info)) continue;
-                var query = $"{character}?expansion={Uri.EscapeDataString(part.Expansion)}&zone={Uri.EscapeDataString(part.Zone)}&encounter={Uri.EscapeDataString(part.Encounter)}";
-                await Fetch("progression-graph/" + query, root => info.ProgPoint = TomestoneData.ParseProgPointFromGraph(root)).ConfigureAwait(false);
-                if (!info.ActivityHidden) await Fetch("activity/" + query, root => TomestoneData.ParseActivityResponse(info, root)).ConfigureAwait(false);
+                if (part == fallback && fallbackInfo is not null)
+                {
+                    fallbackInfo.LookupFailed |= info.LookupFailed;
+                    fallbackInfo.ActivityHidden |= info.ActivityHidden;
+                    info = fallbackInfo;
+                }
+                if (!TomestoneData.HasData(info) && !info.ActivityHidden)
+                {
+                    var query = $"{character}?expansion={Uri.EscapeDataString(part.Expansion)}&zone={Uri.EscapeDataString(part.Zone)}&encounter={Uri.EscapeDataString(part.Encounter)}";
+                    await Fetch("progression-graph/" + query, root => info.ProgPoint = TomestoneData.ParseProgPointFromGraph(root)).ConfigureAwait(false);
+                    if (!info.ActivityHidden) await Fetch("activity/" + query, root => TomestoneData.ParseActivityResponse(info, root)).ConfigureAwait(false);
+                }
                 if (fallback != null && TomestoneData.HasData(info)) info.Phase = part == encounter ? "P2" : "P1";
             }
         if (TomestoneData.HasData(info) || info.BestPercent.HasValue) info.NoLogs = false;
@@ -189,18 +199,7 @@ internal sealed class PlayerLookups : IDisposable
         }
         var fields = string.Join(" ", encounters.Select((e, i) => $"e{i}: encounterRankings(encounterID: {e.Id}, difficulty: {e.Difficulty})").Append("zone: zoneRankings"));
         var selectors = pending.Select((m, i) => $"p{i}: {FFLogsData.Selector(m)} {{ {fields} }}");
-        var body = JsonSerializer.Serialize(new { query = "{ characterData { " + string.Join(" ", selectors) + " } }" });
-        using var queryResponse = await Send(() => new HttpRequestMessage(HttpMethod.Post, "https://www.fflogs.com/api/v2/client")
-        {
-            Headers = { Authorization = new AuthenticationHeaderValue("Bearer", token) },
-            Content = new StringContent(body, Encoding.UTF8, "application/json"),
-        }, ct).ConfigureAwait(false);
-        if (!queryResponse.IsSuccessStatusCode)
-        {
-            if (queryResponse.StatusCode == HttpStatusCode.Unauthorized) token = null;
-            throw new InvalidOperationException(Failure(queryResponse.StatusCode));
-        }
-        using var doc = JsonDocument.Parse(await queryResponse.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+        using var doc = await QueryFFLogs("{ characterData { " + string.Join(" ", selectors) + " } }", ct).ConfigureAwait(false);
         var failedMembers = new HashSet<int>();
         var failedZones = new HashSet<int>();
         if (doc.RootElement.TryGetPath(out var errors, "errors") && errors.ValueKind == JsonValueKind.Array && errors.GetArrayLength() > 0)
@@ -264,23 +263,28 @@ internal sealed class PlayerLookups : IDisposable
         return result;
     }
 
+    private async Task<JsonDocument> QueryFFLogs(string query, CancellationToken ct)
+    {
+        using var response = await Send(() => new HttpRequestMessage(HttpMethod.Post, "https://www.fflogs.com/api/v2/client")
+        {
+            Headers = { Authorization = new AuthenticationHeaderValue("Bearer", token) },
+            Content = new StringContent(JsonSerializer.Serialize(new { query }), Encoding.UTF8, "application/json"),
+        }, ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            if (response.StatusCode == HttpStatusCode.Unauthorized) token = null;
+            throw new InvalidOperationException(Failure(response.StatusCode));
+        }
+        return JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+    }
+
     // Like Passport Checker, use each player's ten most recent public reports for no-clear phases.
     private async Task<Dictionary<(int Member, int Phase), double>> RecentWipes(List<PreviewMember> members,
         (int Id, int Difficulty)[] encounters, HashSet<(int Member, int Phase)> wanted, CancellationToken ct)
     {
         async Task<JsonDocument> Query(string query)
         {
-            using var response = await Send(() => new HttpRequestMessage(HttpMethod.Post, "https://www.fflogs.com/api/v2/client")
-            {
-                Headers = { Authorization = new AuthenticationHeaderValue("Bearer", token) },
-                Content = new StringContent(JsonSerializer.Serialize(new { query }), Encoding.UTF8, "application/json"),
-            }, ct).ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode)
-            {
-                if (response.StatusCode == HttpStatusCode.Unauthorized) token = null;
-                throw new InvalidOperationException(Failure(response.StatusCode));
-            }
-            var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+            var doc = await QueryFFLogs(query, ct).ConfigureAwait(false);
             if (doc.RootElement.TryGetPath(out var errors, "errors") && errors.ValueKind == JsonValueKind.Array && errors.GetArrayLength() > 0)
             { doc.Dispose(); throw new InvalidOperationException("FFLogs recent reports unavailable."); }
             return doc;

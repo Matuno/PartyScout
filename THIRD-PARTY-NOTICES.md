@@ -6,6 +6,10 @@ Upstream is by the FFXIV-CombatReborn / PassportCheckerReborn contributors and d
 
 The upstream member-lookup implementation credits OpenRadar for the approach. Party Scout uses the SDK-supplied FFXIVClientStructs definitions and signatures rather than copying private native layouts.
 
+## DalamudUi
+
+Party Scout uses DalamudUi for Material-inspired controls. License texts for Material UI, MUI X Community, d3-shape, and Material Icons are included as `LICENSE-MUI`, `LICENSE-MUI-X`, `LICENSE-D3-SHAPE`, and `LICENSE-MATERIAL-ICONS`.
+
 ## AI assistance
 
 Party Scout was developed with AI assistance, and its logo was AI-generated.

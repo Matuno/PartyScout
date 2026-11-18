@@ -3,7 +3,7 @@
   "Name": "Party Scout",
   "Punchline": "Find the right party and see who's playing.",
   "Description": "Find parties that match your goals, see who's playing, and keep an eye on friends. Get alerts or opt in to automatic party switching.",
-  "Changelog": "A redesigned compact view, preferred jobs, faster party discovery, and friends alongside your matches.",
+  "Changelog": "The companion unfolds from its glyph. Group search profiles, see contacts by party, and review matching jobs before joining. Your party stays available in duties.",
   "IconUrl": "https://raw.githubusercontent.com/Matuno/DalamudPlugins/main/plugins/PartyScout/icon.png",
   "ApplicableVersion": "any",
   "Tags": [

@@ -167,6 +167,11 @@ internal sealed unsafe class NativePartyFinder(IGameGui gui, IPartyList party, I
     }
 
     public bool DutyPrompt => Visible("ContentsFinderConfirm");
+    internal static bool PullCountdownActive()
+    {
+        var countdown = AgentCountDownSettingDialog.Instance();
+        return countdown != null && countdown->Active && float.IsFinite(countdown->TimeRemaining) && countdown->TimeRemaining > 0;
+    }
     public bool HasOtherDialog
     {
         get

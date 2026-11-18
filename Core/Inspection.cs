@@ -38,20 +38,20 @@ internal sealed record PartyRecruitmentSnapshot(uint Duty, string Description, u
 internal sealed class CurrentPartyContext
 {
     internal PartyRecruitmentSnapshot? Recruitment { get; private set; }
-    internal uint SelectedDuty { get; set; }
+    internal uint Duty { get; private set; }
     internal bool InParty { get; private set; }
     private long partyId;
-    internal uint Duty => SelectedDuty != 0 ? SelectedDuty : Recruitment?.Duty ?? 0;
 
-    internal bool Observe(bool inParty, long id, ulong leader, Listing? candidate)
+    internal bool Observe(bool inParty, long id, ulong leader, Listing? candidate, bool sameParty = false)
     {
-        var ended = InParty && (!inParty || partyId != 0 && id != 0 && partyId != id);
+        var ended = InParty && (!inParty || !sameParty && partyId != 0 && id != 0 && partyId != id);
         if (ended && Recruitment is { } previous && candidate?.Leader == previous.Leader) candidate = null;
         if (ended || !inParty) Clear();
         if (!inParty) return ended;
         InParty = true;
         if (id != 0) partyId = id;
-        if (Recruitment is null && leader != 0 && candidate?.Leader == leader) Remember(id, candidate);
+        if (Recruitment is null && leader != 0 && candidate is { } listing && listing.Leader == leader &&
+            (Duty == 0 || listing.IsDuty && listing.Duty == Duty)) Remember(id, listing);
         return ended;
     }
 
@@ -59,10 +59,14 @@ internal sealed class CurrentPartyContext
     {
         InParty = true;
         if (id != 0) partyId = id;
-        Recruitment = new(listing.IsDuty ? listing.Duty : 0, listing.Description, listing.Id, listing.Leader);
+        var duty = listing.IsDuty ? listing.Duty : 0;
+        RememberDuty(duty);
+        Recruitment = new(duty, listing.Description, listing.Id, listing.Leader);
     }
 
-    internal void Clear() { Recruitment = null; SelectedDuty = 0; InParty = false; partyId = 0; }
+    internal void RememberDuty(uint duty) { if (Duty == 0) Duty = duty; }
+
+    internal void Clear() { Recruitment = null; Duty = 0; InParty = false; partyId = 0; }
 }
 
 internal static class Inspection

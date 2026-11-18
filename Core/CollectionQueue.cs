@@ -7,31 +7,31 @@ internal sealed class CollectionQueue
     internal ulong NextPrioritized(IEnumerable<Listing> matches, IEnumerable<Listing> contacts,
         IReadOnlyDictionary<ulong, PartyDetail> collected, DateTimeOffset now, CollectionQueue contactQueue, bool allowContacts)
     {
-        var preferred = matches.ToArray();
-        var id = Next(preferred, collected, now);
+        var ranked = matches as IReadOnlyList<Listing> ?? matches.ToArray();
+        var id = Next(ranked, collected, now);
         if (id != 0 || !allowContacts) return id;
-        var matchingIds = preferred.Select(listing => listing.Id).ToHashSet();
+        var matchingIds = ranked.Select(listing => listing.Id).ToHashSet();
         return contactQueue.Next(contacts.Where(listing => !matchingIds.Contains(listing.Id)), collected, now);
     }
 
     internal ulong Next(IEnumerable<Listing> listings, IReadOnlyDictionary<ulong, PartyDetail> collected, DateTimeOffset now)
     {
-        var wanted = listings.Where(l => l.Expires > now).DistinctBy(l => l.Id).ToArray();
         foreach (var id in attempted.Where(pair => now - pair.Value >= TimeSpan.FromMinutes(10)).Select(pair => pair.Key).ToArray()) attempted.Remove(id);
-        DateTimeOffset LastVisit(Listing listing)
+        var oldest = DateTimeOffset.MaxValue;
+        ulong next = 0;
+        foreach (var listing in listings.Where(l => l.Expires > now).DistinctBy(l => l.Id))
         {
-            var last = attempted.GetValueOrDefault(listing.Id, DateTimeOffset.MinValue);
-            return collected.TryGetValue(listing.Id, out var data) && data.Collected > last ? data.Collected : last;
+            if (!CanRequest(listing, collected, now)) continue;
+            var visited = attempted.GetValueOrDefault(listing.Id, DateTimeOffset.MinValue);
+            if (collected.TryGetValue(listing.Id, out var detail) && detail.Collected > visited) visited = detail.Collected;
+            if (next != 0 && visited >= oldest) continue;
+            oldest = visited;
+            next = listing.Id;
         }
-        foreach (var l in wanted.OrderBy(LastVisit))
-        {
-            if (CanRequest(l, collected, now))
-            {
-                if (attempted.Count >= 1000 && !attempted.ContainsKey(l.Id)) attempted.Remove(attempted.MinBy(pair => pair.Value).Key);
-                attempted[l.Id] = now; return l.Id;
-            }
-        }
-        return 0;
+        if (next == 0) return 0;
+        if (attempted.Count >= 1000 && !attempted.ContainsKey(next)) attempted.Remove(attempted.MinBy(pair => pair.Value).Key);
+        attempted[next] = now;
+        return next;
     }
     internal bool CanRequest(Listing listing, IReadOnlyDictionary<ulong, PartyDetail> collected, DateTimeOffset now) =>
         listing.Expires > now && (!collected.TryGetValue(listing.Id, out var detail) || !IsFresh(listing, detail, now)) &&

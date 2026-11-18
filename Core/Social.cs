@@ -32,10 +32,22 @@ internal static class Social
     }
 }
 
+internal enum SlotFit { None, Eligible, Preferred }
+
 internal static class SlotRoles
 {
-    internal static bool CanPlay(ulong mask, bool occupied, IEnumerable<uint> jobs) =>
-        !occupied && jobs.Any(job => (mask & Jobs.Mask(job)) != 0);
+    internal static SlotFit Fit(ulong mask, bool occupied, IEnumerable<uint> jobs, IReadOnlyCollection<uint> preferredJobs)
+    {
+        if (occupied) return SlotFit.None;
+        var eligible = false;
+        foreach (var job in jobs)
+        {
+            if ((mask & Jobs.Mask(job)) == 0) continue;
+            if (preferredJobs.Contains(job)) return SlotFit.Preferred;
+            eligible = true;
+        }
+        return eligible ? SlotFit.Eligible : SlotFit.None;
+    }
 
     // PF uses one DPS colour for all three DPS roles.
     internal static int[] Colors(ulong mask) => Jobs.Rows.Where(j => (mask & Jobs.Mask(j)) != 0)

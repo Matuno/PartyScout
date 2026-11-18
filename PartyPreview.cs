@@ -32,9 +32,10 @@ internal sealed unsafe class PartyPreview : IDisposable
     private long requested, background, plateErrorId, manualId;
     private DateTimeOffset requestUntil, nextRequest, listingUntil, listingStarted, nextRead, nextListing, manualUntil;
     private DateTimeOffset listingErrorUntil, plateErrorUntil;
-    private bool listingFailure, plateFailure, manualPlate, namesChanged;
+    private bool listingFailure, plateFailure, namesChanged;
     [ThreadStatic] private static int quietSounds, mutedSystemCalls;
     private volatile bool enabled, keepLateReplies;
+    private PartyDetail? lastReply;
     internal Dictionary<ulong, PartyDetail> Parties { get; } = [];
     internal string? Error { get; }
     internal ulong ManualId { get => (ulong)Interlocked.Read(ref manualId); private set => Interlocked.Exchange(ref manualId, unchecked((long)value)); }
@@ -42,7 +43,7 @@ internal sealed unsafe class PartyPreview : IDisposable
     internal ulong BackgroundId => (ulong)Interlocked.Read(ref background);
     internal bool Busy => BackgroundId != 0;
     internal bool PlatePending => Interlocked.Read(ref requested) != 0;
-    internal bool ManualPlatePending => PlatePending && manualPlate;
+    internal bool ReceivedSince(ulong id, DateTimeOffset since) => Volatile.Read(ref lastReply) is { } reply && reply.Id == id && reply.Collected >= since;
     internal int CachedNames => names.Count;
     internal int SummaryRosters { get; private set; }
     internal int DetailRequests { get; private set; }
@@ -90,7 +91,7 @@ internal sealed unsafe class PartyPreview : IDisposable
         try
         {
             if ((enabled || keepLateReplies) && NativePartyFinder.CopyDetail(data, DateTimeOffset.UtcNow) is { } copy)
-            { id = copy.Id; if (enabled && received.Count < 256) received.Enqueue(copy); }
+            { id = copy.Id; Volatile.Write(ref lastReply, copy); if (enabled && received.Count < 256) received.Enqueue(copy); }
         }
         catch { }
         var late = SweepPolicy.IsLateBackground(id, owned, WasBackgroundListing(id, DateTimeOffset.UtcNow), switchTarget(id), id != 0 && id == ManualId);
@@ -241,9 +242,11 @@ internal sealed unsafe class PartyPreview : IDisposable
                     native.ReleaseBackgroundDetail(visible, false);
                     Interlocked.Exchange(ref background, 0);
                 }
+                var capture = visible != ManualId || !Parties.ContainsKey(visible);
                 ManualId = visible;
                 var agent = AgentLookingForGroup.Instance();
-                if (agent != null && (!Parties.TryGetValue(visible, out var previous) || now - previous.Collected > TimeSpan.FromSeconds(1)))
+                // A window staying open is not a fresh server observation; later replies arrive through the hook.
+                if (agent != null && capture)
                     if (NativePartyFinder.CopyDetail(&agent->LastViewedListing, now) is { } manual) received.Enqueue(manual);
             }
         }
@@ -290,7 +293,7 @@ internal sealed unsafe class PartyPreview : IDisposable
             CacheName(id, "", 0, now.AddMinutes(10)); changed = true;
         }
         if (changed) ApplyNames();
-        foreach (var id in Parties.Where(kv => now - kv.Value.Collected > TimeSpan.FromMinutes(10) || kv.Value.Recruitment?.Expires <= now).Select(kv => kv.Key).ToArray()) Parties.Remove(id);
+        foreach (var id in Parties.Where(kv => kv.Key != ManualId && (now - kv.Value.Collected > TimeSpan.FromMinutes(10) || kv.Value.Recruitment?.Expires <= now)).Select(kv => kv.Key).ToArray()) Parties.Remove(id);
     }
     internal void ResolveNext(IEnumerable<PartyDetail> parties, DateTimeOffset now, bool manualDetail = false)
     {
@@ -300,7 +303,6 @@ internal sealed unsafe class PartyPreview : IDisposable
         {
             if (member.Id == 0 || member.Resolved || names.TryGetValue(member.Id, out var known) && known.Until > now) continue;
             var card = CharaCard.Instance(); if (card == null) return;
-            manualPlate = manualDetail;
             Interlocked.Exchange(ref requested, (long)member.Id);
             Interlocked.Exchange(ref plateErrorId, (long)member.Id); plateErrorUntil = now.AddSeconds(7);
             nextRequest = now.AddMilliseconds(900); requestUntil = now.AddSeconds(5);
@@ -335,7 +337,7 @@ internal sealed unsafe class PartyPreview : IDisposable
         if (!keepSound && soundHook?.IsEnabled == true) soundHook.Disable();
         if (!keepSound && systemSoundHook?.IsEnabled == true) systemSoundHook.Disable();
     }
-    internal void Stop(bool clearNames = true) { Pause(); CancelExpectedManual(); Parties.Clear(); if (clearNames) names.Clear(); }
+    internal void Stop(bool clearNames = true) { Pause(); CancelExpectedManual(); Volatile.Write(ref lastReply, null); Parties.Clear(); if (clearNames) names.Clear(); }
     public void Dispose() { Stop(); soundHook?.Dispose(); systemSoundHook?.Dispose(); listingHook?.Dispose(); packetHook?.Dispose(); }
     private bool WasBackgroundListing(ulong id, DateTimeOffset now) =>
         recentListings.TryGetValue(id, out var until) && now <= until;
