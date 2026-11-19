@@ -21,7 +21,7 @@ public sealed partial class Plugin
     internal bool Scanning { get; private set; }
     internal bool BrowseAll { get; private set; }
     private bool WantsSweep => ContactActive || BrowseAll;
-    private bool CanStartSweep(DateTimeOffset now) => WantsSweep && now >= nextSweepRestart && !Scanning && !collecting &&
+    private bool CanStartSweep(DateTimeOffset now) => Running && WantsSweep && now >= nextSweepRestart && !Scanning && !collecting &&
         !Joining && !profileRefreshPending && !preview.Busy && nativeInspectionPending is null && !NativeInspectionVisible &&
         !windows.NativeFinderInteracting && !preview.DetailOpen && !native.AdventurerPlateOpen();
     internal string ScanStatus { get; private set; } = "Contact scanning is paused.";
@@ -50,7 +50,7 @@ public sealed partial class Plugin
     }
     private void TickProfileRefresh(DateTimeOffset now)
     {
-        if (!Active || Scanning || collecting || Joining || preview.Busy || now < nextRefresh ||
+        if (!Active || !Running || Scanning || collecting || Joining || preview.Busy || now < nextRefresh ||
             nativeInspectionPending is not null || windows.NativeFinderInteracting || native.AdventurerPlateOpen()) return;
         // A summary request preserves the viewed listing. Reopening its finder can steal focus.
         if (preview.DetailOpen)
@@ -141,7 +141,7 @@ public sealed partial class Plugin
 
     internal void StartScan()
     {
-        if (!Active || Joining || !SafeToMonitor()) { ScanStatus = "Start Watch to scan contacts outside duties and combat."; return; }
+        if (!Active || !Running || Joining || !SafeToMonitor()) { ScanStatus = "Start Watch to scan contacts outside duties and combat."; return; }
         if (contactActive) return;
         contactActive = true;
         preview.Quiet(() => { native.RefreshSocial(); return true; }); nextSocialRead = default;
@@ -152,7 +152,7 @@ public sealed partial class Plugin
     internal void SetBrowseAll(bool enabled)
     {
         BrowseAll = enabled;
-        if (!Active || Joining) return;
+        if (!Active || !Running || Joining) return;
         var now = DateTimeOffset.UtcNow;
         if (enabled)
         {
@@ -182,7 +182,7 @@ public sealed partial class Plugin
         nextSweepRestart = DateTimeOffset.UtcNow.AddSeconds(2);
         ScanStatus = reason;
     }
-    internal void RefreshSocialRosters() { if (ContactActive) { preview.Quiet(() => { native.RefreshSocial(); return true; }); nextSocialRead = default; RefreshCompanyRoster(); } }
+    internal void RefreshSocialRosters() { if (ContactActive && Running) { preview.Quiet(() => { native.RefreshSocial(); return true; }); nextSocialRead = default; RefreshCompanyRoster(); } }
     private bool PageCollectionPending(DateTimeOffset now)
     {
         return Matches.Any(match => collectionQueue.CanRequest(match.Listing, preview.Parties, now));

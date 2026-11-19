@@ -52,7 +52,7 @@ internal sealed partial class ScoutWindows
                 if (ImGui.BeginPopup("ScoutMenu"))
                 {
                     if (ImGui.MenuItem(p.Active ? "Pause watching" : "Start watching")) p.Post(p.ToggleMonitoring);
-                    if (ImGui.MenuItem("Auto-join", "", p.Automation, p.Active)) p.Post(p.ToggleAutomation);
+                    if (ImGui.MenuItem("Auto-join", "", p.Automation, p.Active && !p.MonitoringSuspended)) p.Post(p.ToggleAutomation);
                     if (ImGui.MenuItem("Match alerts", "", C.Alerts)) ToggleAlerts();
                     if (ImGui.MenuItem("Show native Party Finder", "", p.ShowNativeFinder)) p.Post(p.ToggleNativeFinder);
                     ImGui.Separator();
@@ -249,7 +249,7 @@ internal sealed partial class ScoutWindows
         if (Material.Button("Auto-join", p.Textures, p.Automation ? "stop" : "play_arrow",
             variant: p.Automation ? MaterialButtonVariant.Contained : MaterialButtonVariant.Text,
             buttonSize: MaterialButtonSize.Small, color: p.Automation ? MaterialControlColor.Warning : MaterialControlColor.Secondary,
-            disabled: !p.Active)) p.Post(p.ToggleAutomation);
+            disabled: !p.Active || p.MonitoringSuspended)) p.Post(p.ToggleAutomation);
         ScoutTooltip("autoHint", p.Automation ? "Stop auto-join and cancel the countdown" : "Enable timed auto-join");
         var utilityX = (wrap ? right : toolRight) - (3 * IconSide + 8 * Scale);
         var utilityY = glyph.Y + (side - IconSide) / 2 + (wrap ? (opensUp ? -32 * Scale : side) : 0);

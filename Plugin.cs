@@ -55,7 +55,6 @@ public sealed partial class Plugin : IDalamudPlugin
     private readonly Dictionary<uint, string> dutyNames;
     private ListingFilter filter;
     private DateTimeOffset nextRefresh, collectingUntil, nextEvaluation, statusUntil;
-    private uint territory;
     private bool collecting, disposed;
     private volatile bool active, contactActive, showNativeFinder;
     private int finderShowEvents, finderDrawEvents, finderVisibleDraws, finderOffThreadEvents;
@@ -66,7 +65,6 @@ public sealed partial class Plugin : IDalamudPlugin
     internal Configuration Settings { get; }
     internal bool Active { get => active; private set => active = value; }
     internal bool ContactActive => contactActive;
-    private bool Running => Active || contactActive;
     internal bool ShowNativeFinder => showNativeFinder;
     internal bool Automation { get; private set; }
     internal AlertState Alert { get; } = new();
@@ -81,7 +79,7 @@ public sealed partial class Plugin : IDalamudPlugin
     internal string? FilterError => filter.Error;
     internal string? FilterErrorFor(SearchProfile profile) => filter.ErrorFor(profile);
     internal DateTimeOffset LastRefresh { get; private set; }
-    internal string? ActionMessage => Joining || DateTimeOffset.UtcNow < statusUntil ? Status : null;
+    internal string? ActionMessage => monitoringSuspended || Joining || DateTimeOffset.UtcNow < statusUntil ? Status : null;
     internal bool UsesJobPreferences => filter.UsesJobPreferences;
     internal string ScoreUnit => UsesJobPreferences ? "fit" : "pts";
     internal double? CurrentScore => View.Party.InParty ? filter.CurrentRank(View.Party.Jobs, View.CurrentJob, partyContext.Duty) : -1;
@@ -192,20 +190,9 @@ public sealed partial class Plugin : IDalamudPlugin
         if (!SafeToMonitor()) { ActionStatus("Available when logged in, outside duties and combat."); return; }
         var wasRunning = Running;
         Active = true; Automation = false;
-        if (!wasRunning) StartEngine();
+        if (!wasRunning) { territory = client.TerritoryType; StartEngine(); }
         nextRefresh = DateTimeOffset.MinValue;
         if (Settings.WatchFriends || Settings.WatchFreeCompany || Settings.CustomFriends.Count > 0) StartScan();
-    }
-    private void StartEngine()
-    {
-        passivePreview = false;
-        territory = client.TerritoryType;
-        Alert.Reset(); Banners.Reset(); listings.Clear(); batch.Clear(); Matches = []; OverviewMatches = []; OverviewListings = []; collecting = false;
-        while (incoming.TryDequeue(out _)) { }
-        nextRefresh = DateTimeOffset.MinValue;
-        preview.Start(); native.SetHidden(FinderVisibility.HideFinder(Running, showNativeFinder));
-        Status = "Connecting to Party Finder…";
-        pf.ReceiveListing += Receive;
     }
     internal void ToggleMonitoring() { if (Active) Stop("Monitoring paused."); else Open(); }
     internal void ToggleNativeFinder()
@@ -225,7 +212,7 @@ public sealed partial class Plugin : IDalamudPlugin
     }
     internal void ToggleAutomation()
     {
-        Automation = Active && !Automation;
+        Automation = Active && Running && !Automation;
         if (Automation) return;
         if (Joining) CancelJoin("Party switch cancelled. Check your party.");
         Alert.Clear();
@@ -261,7 +248,7 @@ public sealed partial class Plugin : IDalamudPlugin
 
     private void Receive(IPartyFinderListing l, IPartyFinderListingEventArgs args)
     {
-        if (disposed || incoming.Count >= 1000 || l.Id == 0 || l.SlotsAvailable is < 1 or > 48 || l.SlotsFilled > l.SlotsAvailable) return;
+        if (disposed || !Running || incoming.Count >= 1000 || l.Id == 0 || l.SlotsAvailable is < 1 or > 48 || l.SlotsFilled > l.SlotsAvailable) return;
         var now = DateTimeOffset.UtcNow;
         var slots = l.Slots.Select(s => s.Accepting.Aggregate(0UL, (mask, flag) => mask | (ulong)flag)).ToArray();
         var search = (uint)l.SearchArea;
@@ -332,9 +319,9 @@ public sealed partial class Plugin : IDalamudPlugin
     }
     private bool InDuty => dutyState.ContentFinderCondition.RowId != 0 || dutyState.IsDutyStarted ||
         conditions.Any(ConditionFlag.BoundByDuty, ConditionFlag.BoundByDuty56, ConditionFlag.BoundByDuty95);
-    private bool SafeToMonitor() => client.IsLoggedIn && !client.IsPvP && !InDuty && !conditions.Any(ConditionFlag.InCombat,
+    private bool SafeToMonitor() => client.IsLoggedIn && player.IsLoaded && !client.IsPvP && !InDuty && !conditions.Any(ConditionFlag.InCombat,
         ConditionFlag.BetweenAreas, ConditionFlag.BetweenAreas51, ConditionFlag.LoggingOut) && !native.DutyPrompt;
-    private bool SafeToJoin() => SafeToMonitor() && !conditions.Any(ConditionFlag.InDutyQueue, ConditionFlag.WaitingForDuty,
+    private bool SafeToJoin() => !monitoringSuspended && SafeToMonitor() && !conditions.Any(ConditionFlag.InDutyQueue, ConditionFlag.WaitingForDuty,
         ConditionFlag.WaitingForDutyFinder, ConditionFlag.Occupied, ConditionFlag.OccupiedInCutSceneEvent,
         ConditionFlag.WatchingCutscene, ConditionFlag.WatchingCutscene78, ConditionFlag.Crafting, ConditionFlag.Gathering) && !View.Party.Alliance;
 
@@ -351,10 +338,15 @@ public sealed partial class Plugin : IDalamudPlugin
                 ObserveCurrentParty(previousParty, now, client.IsLoggedIn ? dutyState.ContentFinderCondition.RowId : 0);
                 if (Active && !Joining && (previousParty.InParty != View.Party.InParty || previousParty.Leader != View.Party.Leader || previousParty.PartyId != View.Party.PartyId))
                 { Alert.Reset(); Automation = false; Banners.Hide(); }
-                if (Running && (!SafeToMonitor() || territory != client.TerritoryType)) Stop("Stopped for duty or client-state change.", true);
+                if (WatchRequested)
+                {
+                    var loggedIn = client.IsLoggedIn && !conditions[ConditionFlag.LoggingOut];
+                    UpdateMonitoring(client.TerritoryType, loggedIn, loggedIn && InDuty, loggedIn && SafeToMonitor());
+                }
                 if (windows.DutyPreviewPending) windows.UpdateDutyPreview(now, NativePartyFinder.PullCountdownActive());
-                if (Active) RefreshGearsets(now);
+                if (Active && Running) RefreshGearsets(now);
                 while (actions.TryDequeue(out var action)) action();
+                if (monitoringSuspended) return;
                 if (!Running) { CollectManualWhenIdle(now); return; }
                 native.SetHidden(FinderVisibility.HideFinder(Running, showNativeFinder));
                 if (showNativeFinder || NativeInspectionVisible) native.SetManualDetailHidden(false);
@@ -452,11 +444,11 @@ public sealed partial class Plugin : IDalamudPlugin
             lock (sync)
             {
                 var page = native.Page();
-                return JsonSerializer.Serialize(new { ok = !disposed && (!Automation || Active) && (!Joining || Active) && (!Scanning || Running) && (!InDuty || !Running) &&
+                return JsonSerializer.Serialize(new { ok = !disposed && (!Automation || Active && Running) && (!Joining || Active && Running) && (!Scanning || Running) && (!InDuty || !WatchRequested) &&
                     (!preview.Busy || (Running || passivePreview) && (!Joining || joinStep == JoinStep.OpenTarget && !joinDetailRequested)),
                 test = "smoke", assemblySha256 = assemblyHash, uiLibrary = typeof(DalamudUi.Material).Assembly.GetName().Name,
                 fontsReady = FontsReady, fontsFailed = FontsFailed, frameworkThread = framework.IsInFrameworkUpdateThread,
-                active = Active, automation = Automation, joining = Joining, nativeOpen = native.Capture().Open,
+                active = Active, monitoringSuspended, automation = Automation, joining = Joining, nativeOpen = native.Capture().Open,
                 joinWaitingForScan = Joining && joinStep == JoinStep.OpenTarget && (collecting || preview.Busy),
                 hiddenByPlugin = native.Hidden, showNativeFinder, manualDetailHiddenByPlugin = native.ManualDetailHidden, ownsFinder, profileRefreshPending, matches = Matches.Length, displayedMatches = OverviewMatches.Length, cachedListings = listings.Count,
                 browseAll = BrowseAll, scopedListings = OverviewListings.Length,

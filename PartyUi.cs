@@ -13,6 +13,8 @@ internal sealed partial class ScoutWindows
     private string customName = "", worldSearch = "";
     private bool materialContactsExpanded;
     private ushort customWorld;
+    private const float CompactSlotSize = 16;
+    private const float SlotGap = 3;
     private static readonly Vector4[] RoleColors = [new(.28f, .48f, .92f, 1), new(.27f, .70f, .38f, 1), new(.85f, .29f, .32f, 1)];
 
     private void OverviewAll()
@@ -85,6 +87,7 @@ internal sealed partial class ScoutWindows
         using (ImRaii.Disabled(!canInspect))
         using (ImRaii.PushColor(ImGuiCol.Button, Theme.Paper).Push(ImGuiCol.ButtonHovered, Theme.Overlay))
             if (ImGui.Button($"##party{listing.Id}", new Vector2(width, height))) OpenListingPage(listing);
+        if (!ImGui.IsItemVisible()) return;
         var min = ImGui.GetItemRectMin();
         var max = ImGui.GetItemRectMax();
         var fill = $"{listing.Filled}/{listing.Total}";
@@ -93,13 +96,18 @@ internal sealed partial class ScoutWindows
         var right = max.X - 12 * Scale;
         var titlePos = PixelAligned(new Vector2(left, min.Y + (height - 2 * lineHeight) / 2));
         var titleWidth = Math.Max(0, right - fillWidth - left - padding);
+        var slots = CompactSlotLayout(listing.Total, (right - left) * .65f);
+        var slotPos = PixelAligned(new Vector2(right - slots.Width, titlePos.Y + (3 * lineHeight - CompactSlotSize * Scale) / 2));
         var drawing = ImGui.GetWindowDrawList();
         using (p.HeadingFont.Push())
             drawing.AddText(titlePos, ImGui.GetColorU32(yours ? Accent : better ? Theme.Success : Theme.Text), Fit(title, titleWidth));
         drawing.AddText(PixelAligned(new Vector2(right - fillWidth, titlePos.Y)), ImGui.GetColorU32(Muted), fill);
-        drawing.AddText(titlePos + new Vector2(0, lineHeight), ImGui.GetColorU32(Muted), Fit(description, Math.Max(0, right - left)));
+        var descriptionWidth = right - left - (slots.Count > 0 ? slots.Width + padding : 0);
+        drawing.AddText(titlePos + new Vector2(0, lineHeight), ImGui.GetColorU32(Muted), Fit(description, Math.Max(0, descriptionWidth)));
         if (canInspect && ImGui.IsItemHovered()) ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
-        if (canInspect) ScoutTooltip("listingSummary" + listing.Id, $"{title} · {fill}\n{description}");
+        if (!ImGui.IsMouseHoveringRect(slotPos, slotPos + new Vector2(slots.Width, CompactSlotSize * Scale)))
+            ScoutTooltip("listingSummary" + listing.Id, $"{title} · {fill}\n{description}");
+        if (slots.Count > 0) DrawCompactSlotStrip(listing, match, slotPos, slots.Count);
     }
 
     private void ListingCard(Listing listing, Match? match)
@@ -143,7 +151,11 @@ internal sealed partial class ScoutWindows
                 ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
                 if (ImGui.IsMouseClicked(ImGuiMouseButton.Left)) inspect!();
             }
-        }, inspect, p.HeadingFont, true))
+        }, inspect, p.HeadingFont, true, (origin, width) =>
+        {
+            var slots = CompactSlotLayout(listing.Total, width);
+            if (slots.Count > 0) DrawCompactSlotStrip(listing, match, PixelAligned(origin), slots.Count);
+        }))
             ImGui.GetStateStorage().SetInt(stateId, expanded ? 1 : 0);
         ImGui.PopID();
     }
@@ -270,37 +282,65 @@ internal sealed partial class ScoutWindows
         ImGui.TextColored(color, fitted);
         if (fitted != text && ImGui.IsItemHovered()) ImGui.SetTooltip(text);
     }
-    private void SlotStrip(Listing listing, PartyDetail? detail, Match? match)
+    private (int Count, float Width) CompactSlotLayout(int total, float available)
+    {
+        var stride = (CompactSlotSize + SlotGap) * Scale;
+        var gap = SlotGap * Scale;
+        for (var count = Math.Min(8, total); count > 0; count--)
+        {
+            var width = count * stride - gap;
+            if (count < total) width += gap + ImGui.CalcTextSize($"+{total - count}").X;
+            if (width <= available) return (count, width);
+        }
+        return (0, 0);
+    }
+
+    private void DrawCompactSlotStrip(Listing listing, Match? match, Vector2 origin, int count)
+    {
+        using var id = ImRaii.PushId(listing.Id.ToString());
+        SlotStrip(listing, p.Collected(listing.Id), match, CompactSlotSize, count, origin);
+        if (count < listing.Total)
+        {
+            var pos = origin + new Vector2(count * (CompactSlotSize + SlotGap) * Scale, (CompactSlotSize * Scale - ImGui.GetTextLineHeight()) / 2);
+            ImGui.GetWindowDrawList().AddText(PixelAligned(pos), ImGui.GetColorU32(Muted), $"+{listing.Total - count}");
+        }
+    }
+
+    private void SlotStrip(Listing listing, PartyDetail? detail, Match? match, float slotSize = 22, int limit = 48, Vector2? origin = null)
     {
         var profiles = match is null ? C.EnabledProfiles.Where(profile => profile.Targets(listing)).ToArray() : [];
         var playableJobs = match?.PlayableJobs ?? profiles.SelectMany(profile => profile.Jobs).Distinct().Where(listing.Accepts).ToArray();
         IReadOnlyCollection<uint> preferredJobs = match is not null ? match.JobPreferences.Keys :
             profiles.SelectMany(profile => profile.PreferredJobs.Where(profile.Jobs.Contains)).Distinct().Where(listing.Accepts).ToArray();
-        for (var i = 0; i < Math.Min(48, listing.Total); i++)
+        for (var i = 0; i < Math.Min(limit, listing.Total); i++)
         {
-            if (i % 8 != 0) ImGui.SameLine(0, 3 * Scale);
+            if (origin is null && i % 8 != 0) ImGui.SameLine(0, SlotGap * Scale);
             var member = detail?.Members.FirstOrDefault(m => m.Slot == i);
             var job = member?.Job ?? (i < listing.JobsPresent.Length ? listing.JobsPresent[i] : (byte)0);
             var mask = i < listing.Slots.Length ? listing.Slots[i] : 0;
             var occupied = member is not null || job > 0;
             var fit = SlotRoles.Fit(mask, occupied, playableJobs, preferredJobs);
             var tooltip = member is { Resolved: true } ? member.Name + " · " + member.World :
-                job > 0 ? p.JobNames([job]) : member is not null ? "Occupied · job unavailable" : "Open: " + p.JobNames(Jobs.Rows.Where(j => (mask & Jobs.Mask(j)) != 0).Select(j => (uint)j));
+                job > 0 ? p.JobNames([job]) : member is not null ? "Occupied · job unavailable" : "Open: " + OpenJobs(mask);
             if (fit != SlotFit.None)
             {
                 tooltip += "\nEligible: " + p.JobNames(playableJobs.Where(j => (mask & Jobs.Mask(j)) != 0));
                 if (fit == SlotFit.Preferred) tooltip += "\nPreferred: " + p.JobNames(preferredJobs.Where(j => (mask & Jobs.Mask(j)) != 0));
             }
             ImGui.PushID(i);
-            Slot(job, mask, occupied, tooltip, fit);
+            Slot(job, mask, occupied, tooltip, fit, slotSize, origin + new Vector2(i * (slotSize + SlotGap) * Scale, 0));
             ImGui.PopID();
         }
     }
-    private void Slot(byte job, ulong mask, bool occupied, string tooltip, SlotFit fit = SlotFit.None)
+    private void Slot(byte job, ulong mask, bool occupied, string tooltip, SlotFit fit = SlotFit.None, float slotSize = 22, Vector2? position = null)
     {
+        var size = slotSize * Scale;
+        var pos = position ?? ImGui.GetCursorScreenPos();
+        if (position is null) ImGui.Dummy(new Vector2(size));
+        // The card already owns the space. Register the chip only for its tooltip.
+        else if (!ImGuiP.ItemAdd(new ImRect(pos, pos + new Vector2(size)), 0)) return;
         var colors = occupied ? SlotRoles.Colors(Jobs.Mask(job)) : SlotRoles.Colors(mask);
-        var size = 22 * Scale; var pos = ImGui.GetCursorScreenPos(); var draw = ImGui.GetWindowDrawList();
-        ImGui.Dummy(new Vector2(size));
+        var draw = ImGui.GetWindowDrawList();
         if (colors.Length == 0) draw.AddRectFilled(pos, pos + new Vector2(size), ImGui.GetColorU32(new Vector4(.25f, .28f, .33f, 1)), 3 * Scale);
         else for (var stripe = 0; stripe < colors.Length; stripe++)
             draw.AddRectFilled(pos + new Vector2(size * stripe / colors.Length, 0), pos + new Vector2(size * (stripe + 1) / colors.Length, size), ImGui.GetColorU32(RoleColors[colors[stripe]]));
@@ -310,10 +350,11 @@ internal sealed partial class ScoutWindows
         {
             using var font = p.IconFont.Push();
             var glyph = (fit == SlotFit.Preferred ? FontAwesomeIcon.Star : FontAwesomeIcon.Check).ToIconString();
-            var glyphSize = ImGui.CalcTextSize(glyph) * .7f;
+            var factor = .7f * slotSize / 22;
+            var glyphSize = ImGui.CalcTextSize(glyph) * factor;
             var glyphPos = pos + (new Vector2(size) - glyphSize) / 2;
             glyphPos = PixelAligned(glyphPos);
-            var fontSize = ImGui.GetFontSize() * .7f;
+            var fontSize = ImGui.GetFontSize() * factor;
             draw.AddText(ImGui.GetFont(), fontSize, glyphPos + new Vector2(1 * Scale), ImGui.GetColorU32(new Vector4(0, 0, 0, .8f)), glyph, 0);
             draw.AddText(ImGui.GetFont(), fontSize, glyphPos, ImGui.GetColorU32(Vector4.One), glyph, 0);
         }
